@@ -38,7 +38,7 @@ namespace TerrainChunkPrivate
 	constexpr float BiomeInteriorWidthScale = 0.5f;
 
 	// Arrays indexed by EBiomeType, Ocean included.
-	constexpr int32 BiomeCount = 8;
+	constexpr int32 BiomeCount = 11;
 
 	// Normalized Perlin rarely exceeds ~0.85, so mountain mass is stretched to an effective maximum of 0.88
 	// for peaks to actually reach MountainMaxHeight.
@@ -798,7 +798,7 @@ private:
 
 	void GetSeedOffsets(float& OutSeedLow, float& OutSeedHigh) const;
 
-	/** Biome of the Voronoi cell whose jittered site is CellCenter, drawn by distance from the world origin. */
+	/** Biome of the Voronoi cell whose jittered site is CellCenter, from distance and latitude after a low-frequency warp. */
 	EBiomeType DetermineBiomeForCell(FVector2D CellCenter) const;
 
 	/** Jittered Voronoi site of a biome cell. */
@@ -848,7 +848,9 @@ private:
 	float SampleBiomeDetail(float WorldX, float WorldY, EBiomeType Biome, float DistanceToEdge, float SeedLow, float SeedHigh) const;
 
 	float ComputePlains(float WorldX, float WorldY, float Interior, float SeedLow, float SeedHigh) const;
+	float ComputeTundra(float WorldX, float WorldY, float Interior, float SeedLow, float SeedHigh) const;
 	float ComputeForest(float WorldX, float WorldY, float Interior, float SeedLow, float SeedHigh) const;
+	float ComputeJungle(float WorldX, float WorldY, float Interior, float SeedLow, float SeedHigh) const;
 	float ComputeSwamp(float WorldX, float WorldY, float SeedLow, float SeedHigh) const;
 
 	/** Dune height above DesertBaseHeight deep inside a desert cell: gentle flanks, sharp crests. */
@@ -1229,57 +1231,61 @@ void FTerrainGenerator::GetSeedOffsets(float& OutSeedLow, float& OutSeedHigh) co
 
 EBiomeType FTerrainGenerator::DetermineBiomeForCell(FVector2D CellCenter) const
 {
-	using namespace TerrainChunkPrivate;
+	float SeedLow = 0.0f;
+	float SeedHigh = 0.0f;
+	GetSeedOffsets(SeedLow, SeedHigh);
 
-	const float DistFromCenter = static_cast<float>(CellCenter.Size());
-	if (DistFromCenter < CenterPlainsRadius)
+	// The Voronoi site stays where the grid put it; only the biome label is measured on the warped point.
+	constexpr float WarpFrequency = 0.000004f;
+	const float WarpX = FMath::PerlinNoise2D(FVector2D(CellCenter.X * WarpFrequency + SeedLow, CellCenter.Y * WarpFrequency + SeedHigh)) * BiomeWarpAmplitude;
+	const float WarpY = FMath::PerlinNoise2D(FVector2D(CellCenter.X * WarpFrequency + SeedHigh + 19.0f, CellCenter.Y * WarpFrequency + SeedLow + 37.0f)) * BiomeWarpAmplitude;
+	const float X = static_cast<float>(CellCenter.X) + WarpX;
+	const float Y = static_cast<float>(CellCenter.Y) + WarpY;
+	const float Dist = static_cast<float>(FVector2D(X, Y).Size());
+
+	if (Y > TundraLatitude)
 	{
-		return EBiomeType::Plains;
+		return EBiomeType::Tundra;
 	}
 
-	// Deserts are not rolled per cell: every cell whose site lies in a desert region becomes desert, so the
-	// region size sets the desert size.
-	if (IsInDesertRegion(CellCenter))
+	if (Y < DesertLatitude)
 	{
+		// Shift the meridian so the jungle/desert border is not a straight line down the Y axis.
+		constexpr float LongitudeFrequency = 0.00003f;
+		constexpr float LongitudeAmplitude = 100000.0f;
+		const float LongitudeNoise = FMath::PerlinNoise2D(FVector2D(X * LongitudeFrequency + SeedLow, Y * LongitudeFrequency + SeedHigh)) * LongitudeAmplitude;
+		if (X + LongitudeNoise > JungleLongitude)
+		{
+			return EBiomeType::Jungle;
+		}
 		return EBiomeType::Desert;
 	}
 
-	const uint32 CellHash = HashCombine(HashCombine(GetTypeHash(CellCenter.X), GetTypeHash(CellCenter.Y)), static_cast<uint32>(InitData.Seed));
-	FRandomStream Stream(static_cast<int32>(CellHash));
-
-	// 0 at the world origin, 1 at BiomeFalloffRadius and beyond.
-	const float Remoteness = FMath::Clamp(DistFromCenter / FMath::Max(BiomeFalloffRadius, 1.0f), 0.0f, 1.0f);
-
-	// Plains dominate near the origin and keep a 10% weight far out. Forests spread first, then swamps and
-	// plateaus, and mountains only appear in the outer half. Ocean is never rolled: it comes from continentalness.
-	// Oasis is never rolled either: it is placed inside desert cells.
-	float Weights[BiomeCount] = {};
-	Weights[static_cast<int32>(EBiomeType::Plains)] = FMath::Clamp(1.0f - Remoteness, 0.1f, 1.0f);
-	Weights[static_cast<int32>(EBiomeType::Forest)] = 0.6f * FMath::SmoothStep(0.0f, 0.5f, Remoteness);
-	Weights[static_cast<int32>(EBiomeType::Swamp)] = 0.3f * FMath::SmoothStep(0.2f, 0.7f, Remoteness);
-	Weights[static_cast<int32>(EBiomeType::Plateau)] = 0.35f * FMath::SmoothStep(0.3f, 0.8f, Remoteness);
-	Weights[static_cast<int32>(EBiomeType::Mountains)] = 0.5f * FMath::SmoothStep(0.5f, 1.0f, Remoteness);
-
-	// The start island leans to the starting biomes: the harsher ones fade out towards the origin.
-	const float StartBiomeSuppression = 1.0f - ComputeStartIslandBias(static_cast<float>(CellCenter.X), static_cast<float>(CellCenter.Y));
-	Weights[static_cast<int32>(EBiomeType::Swamp)] *= StartBiomeSuppression;
-	Weights[static_cast<int32>(EBiomeType::Plateau)] *= StartBiomeSuppression;
-	Weights[static_cast<int32>(EBiomeType::Mountains)] *= StartBiomeSuppression;
-
-	float TotalWeight = 0.0f;
-	for (const float Weight : Weights)
+	if (Dist > MountainMinRadius && Dist < MountainMaxRadius)
 	{
-		TotalWeight += Weight;
+		return EBiomeType::Mountains;
 	}
 
-	float Roll = Stream.FRand() * TotalWeight;
-	for (int32 BiomeIndex = 0; BiomeIndex < BiomeCount; ++BiomeIndex)
+	if (Dist < PlainsRadius)
 	{
-		if (Weights[BiomeIndex] > 0.0f && Roll < Weights[BiomeIndex])
+		return EBiomeType::Plains;
+	}
+	if (Dist >= ForestMinRadius && Dist <= ForestMaxRadius)
+	{
+		// Clearings: a high slice of a second noise, so most of the ring stays forest.
+		constexpr float ClearingFrequency = 0.000008f;
+		const float Clearing = FMath::PerlinNoise2D(FVector2D(X * ClearingFrequency + SeedLow + 53.0f, Y * ClearingFrequency + SeedHigh + 71.0f));
+		if (Clearing > 0.6f)
 		{
-			return static_cast<EBiomeType>(BiomeIndex);
+			return EBiomeType::Plains;
 		}
-		Roll -= Weights[BiomeIndex];
+		return EBiomeType::Forest;
+	}
+	if (Dist > SwampPlateauRadius)
+	{
+		constexpr float SplitFrequency = 0.000003f;
+		const float Split = FMath::PerlinNoise2D(FVector2D(X * SplitFrequency + SeedHigh + 91.0f, Y * SplitFrequency + SeedLow + 113.0f));
+		return Split >= 0.0f ? EBiomeType::Swamp : EBiomeType::Plateau;
 	}
 
 	return EBiomeType::Plains;
@@ -1622,6 +1628,18 @@ float FTerrainGenerator::SampleBiomeDetail(float WorldX, float WorldY, EBiomeTyp
 		Frequency = DesertDetailFrequency;
 		Amplitude = DesertDetailAmplitude;
 		break;
+	case EBiomeType::Tundra:
+		Frequency = TundraDetailFrequency;
+		Amplitude = TundraDetailAmplitude;
+		break;
+	case EBiomeType::Jungle:
+		Frequency = JungleDetailFrequency;
+		Amplitude = JungleDetailAmplitude;
+		break;
+	case EBiomeType::Foothills:
+		Frequency = FoothillsDetailFrequency;
+		Amplitude = FoothillsDetailAmplitude;
+		break;
 	default:
 		// Ocean is sampled separately; swamp and oasis stay flat so puddles and ponds keep a clean shore.
 		return 0.0f;
@@ -1659,6 +1677,15 @@ float FTerrainGenerator::ComputePlains(float WorldX, float WorldY, float Interio
 	return LandEdgeZ + SmoothInterior * (PlainsRise + HillsNoise * PlainsHillsAmplitude);
 }
 
+float FTerrainGenerator::ComputeTundra(float WorldX, float WorldY, float Interior, float SeedLow, float SeedHigh) const
+{
+	using namespace TerrainChunkPrivate;
+
+	const float SmoothInterior = FMath::SmoothStep(0.0f, 1.0f, Interior);
+	const float HillsNoise = SampleHills(WorldX, WorldY, TundraHillsFrequency, SeedLow, SeedHigh);
+	return LandEdgeZ + SmoothInterior * (PlainsRise + HillsNoise * TundraHillsAmplitude);
+}
+
 float FTerrainGenerator::ComputeForest(float WorldX, float WorldY, float Interior, float SeedLow, float SeedHigh) const
 {
 	using namespace TerrainChunkPrivate;
@@ -1689,6 +1716,33 @@ float FTerrainGenerator::ComputeForest(float WorldX, float WorldY, float Interio
 	const float Hills01 = Hills * 0.5f + 0.5f;
 
 	return LandEdgeZ + SmoothInterior * (ForestRise + Hills01 * ForestHillsHeight);
+}
+
+float FTerrainGenerator::ComputeJungle(float WorldX, float WorldY, float Interior, float SeedLow, float SeedHigh) const
+{
+	using namespace TerrainChunkPrivate;
+
+	const float SmoothInterior = FMath::SmoothStep(0.0f, 1.0f, Interior);
+	if (SmoothInterior <= 0.0f)
+	{
+		return LandEdgeZ;
+	}
+
+	const FVector2D MainUV(WorldX * JungleHillsFrequency + SeedHigh + 233.0f, WorldY * JungleHillsFrequency + SeedLow + 263.0f);
+	const float MainHills = FMath::PerlinNoise2D(MainUV);
+
+	constexpr float FineCos = 0.64279f;
+	constexpr float FineSin = 0.76604f;
+	const float FineFrequency = JungleHillsFrequency * 2.1f;
+	const float FineX = (WorldX * FineCos - WorldY * FineSin) * FineFrequency + SeedLow + 307.0f;
+	const float FineY = (WorldX * FineSin + WorldY * FineCos) * FineFrequency + SeedHigh + 331.0f;
+	const float FineHills = FMath::PerlinNoise2D(FVector2D(FineX, FineY));
+
+	constexpr float OctaveRangeCompensation = 0.8f;
+	const float Hills = FMath::Clamp((MainHills * 0.75f + FineHills * 0.25f) / OctaveRangeCompensation, -1.0f, 1.0f);
+	const float Hills01 = Hills * 0.5f + 0.5f;
+
+	return LandEdgeZ + SmoothInterior * (ForestRise + Hills01 * JungleHillsHeight);
 }
 
 float FTerrainGenerator::ComputeSwamp(float WorldX, float WorldY, float SeedLow, float SeedHigh) const
@@ -1958,6 +2012,12 @@ float FTerrainGenerator::ComputeBiomeHeight(float WorldX, float WorldY, EBiomeTy
 		return ComputeMountains(WorldX, WorldY, MacroSample, Interior, SeedLow, SeedHigh, DetailScale);
 	case EBiomeType::Desert:
 		return ComputeDesert(WorldX, WorldY, Interior, SeedLow, SeedHigh);
+	case EBiomeType::Tundra:
+		return ComputeTundra(WorldX, WorldY, Interior, SeedLow, SeedHigh);
+	case EBiomeType::Jungle:
+		return ComputeJungle(WorldX, WorldY, Interior, SeedLow, SeedHigh);
+	case EBiomeType::Foothills:
+		return ComputeMountains(WorldX, WorldY, MacroSample, Interior, SeedLow, SeedHigh, DetailScale);
 	default:
 		return LandEdgeZ;
 	}
@@ -2473,6 +2533,11 @@ float FTerrainGenerator::ComputeHeight(float WorldX, float WorldY, TConstArrayVi
 	{
 		StrictBiome = EBiomeType::Ocean;
 	}
+	else if (Context.PrimaryBiome == EBiomeType::Mountains && BaseElevation < FoothillsMaxHeight)
+	{
+		StrictBiome = EBiomeType::Foothills;
+		DetailElevation = SampleBiomeDetail(WorldX, WorldY, EBiomeType::Foothills, Context.DistanceToEdge, SeedLow, SeedHigh);
+	}
 
 	if (OutBiomeId)
 	{
@@ -2502,7 +2567,7 @@ float FTerrainGenerator::ComputeHeight(float WorldX, float WorldY, TConstArrayVi
 		// Sea and oasis are not Voronoi weights. They become the heavier biome and keep the previous leader as
 		// the other ID, so a shore or oasis rim does not interpolate through unrelated biome numbers.
 		const int32 StrictId = static_cast<int32>(StrictBiome);
-		if ((StrictBiome == EBiomeType::Ocean || StrictBiome == EBiomeType::Oasis) && StrictId != PrimaryId)
+		if ((StrictBiome == EBiomeType::Ocean || StrictBiome == EBiomeType::Oasis || StrictBiome == EBiomeType::Foothills) && StrictId != PrimaryId)
 		{
 			SecondaryId = PrimaryId;
 			SecondaryWeight = PrimaryWeight;

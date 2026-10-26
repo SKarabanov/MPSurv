@@ -122,3 +122,40 @@ void UOasisBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 	Settings.OasisWaterRadius = OasisWaterRadius;
 	Settings.OasisMaxDuneHeight = OasisMaxDuneHeight;
 }
+
+UTundraBiomeDataAsset::UTundraBiomeDataAsset()
+{
+	BiomeType = EBiomeType::Tundra;
+}
+
+void UTundraBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
+{
+	Settings.TundraHillsFrequency = TundraHillsFrequency;
+	Settings.TundraHillsAmplitude = TundraHillsAmplitude;
+	Settings.TundraDetailFrequency = TundraDetailFrequency;
+	Settings.TundraDetailAmplitude = TundraDetailAmplitude;
+}
+
+UJungleBiomeDataAsset::UJungleBiomeDataAsset()
+{
+	BiomeType = EBiomeType::Jungle;
+}
+
+void UJungleBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
+{
+	Settings.JungleHillsFrequency = JungleHillsFrequency;
+	Settings.JungleHillsHeight = JungleHillsHeight;
+	Settings.JungleDetailFrequency = JungleDetailFrequency;
+	Settings.JungleDetailAmplitude = JungleDetailAmplitude;
+}
+
+UFoothillsBiomeDataAsset::UFoothillsBiomeDataAsset()
+{
+	BiomeType = EBiomeType::Foothills;
+}
+
+void UFoothillsBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
+{
+	Settings.FoothillsDetailFrequency = FoothillsDetailFrequency;
+	Settings.FoothillsDetailAmplitude = FoothillsDetailAmplitude;
+}

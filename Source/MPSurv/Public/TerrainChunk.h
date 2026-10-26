@@ -30,7 +30,13 @@ enum class EBiomeType : uint8
 	Desert = 6,
 
 	/** Sub-biome of the desert: never drawn for a Voronoi cell, only written for ground within an oasis radius. */
-	Oasis = 7
+	Oasis = 7,
+
+	Tundra = 8,
+	Jungle = 9,
+
+	/** Sub-biome of the mountains: never drawn for a Voronoi cell, only where a mountain stands below FoothillsMaxHeight. */
+	Foothills = 10
 };
 
 /** Voronoi biomes at a point. */
@@ -148,6 +154,54 @@ struct FTerrainGenerationSettings
 	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "1.0", Units = "cm"))
 	float BiomeFalloffRadius = 150000.0f;
 
+	/** How far a low-frequency warp shifts a site before distance and latitude are measured, so ring borders stay ragged. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
+	float BiomeWarpAmplitude = 120000.0f;
+
+	/** Sites closer than this to the world origin are plains. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
+	float PlainsRadius = 200000.0f;
+
+	/** Kept so existing assets still load. The northern band is TundraLatitude. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (Units = "cm"))
+	float MountainLatitude = 400000.0f;
+
+	/** Warped Y below this is desert. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (Units = "cm"))
+	float DesertLatitude = -400000.0f;
+
+	/** Inner radius of the forest ring. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
+	float ForestMinRadius = 150000.0f;
+
+	/** Outer radius of the forest ring. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
+	float ForestMaxRadius = 600000.0f;
+
+	/** Past this distance, and outside the forest ring, cells split between swamp and plateau. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
+	float SwampPlateauRadius = 400000.0f;
+
+	/** Inner radius of the mountain ring. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
+	float MountainMinRadius = 400000.0f;
+
+	/** Outer radius of the mountain ring. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
+	float MountainMaxRadius = 550000.0f;
+
+	/** Warped Y above this is tundra. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (Units = "cm"))
+	float TundraLatitude = 500000.0f;
+
+	/** Warped X above this, on the southern band, is jungle. Desert lies to the west. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (Units = "cm"))
+	float JungleLongitude = 0.0f;
+
+	/** Mountain ground below this height is written as foothills. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
+	float FoothillsMaxHeight = 8000.0f;
+
 	// Per-biome shape. Filled on the game thread from the matching UBiomeDataAsset.
 	// Desert region size and oasis spacing are world layout and come from UWorldGenSettings.
 	// These values are the fallback when that asset is missing.
@@ -183,6 +237,20 @@ struct FTerrainGenerationSettings
 	/** Amplitude of fine surface roughness on the plains. */
 	float PlainsDetailAmplitude = 200.0f;
 
+	// --- Tundra ---
+
+	/** Frequency of rolling tundra hills. */
+	float TundraHillsFrequency = 0.00009f;
+
+	/** Height of rolling tundra hills deep inside a tundra cell. */
+	float TundraHillsAmplitude = 400.0f;
+
+	/** Frequency of fine surface roughness on the tundra. */
+	float TundraDetailFrequency = 0.00025f;
+
+	/** Amplitude of fine surface roughness on the tundra. */
+	float TundraDetailAmplitude = 200.0f;
+
 	// --- Forest ---
 
 	/** Frequency of forest hills. Higher values give smaller, more frequent hills; 0.0002 is a ~50 m wavelength. */
@@ -196,6 +264,20 @@ struct FTerrainGenerationSettings
 
 	/** Amplitude of fine surface roughness in the forest. */
 	float ForestDetailAmplitude = 200.0f;
+
+	// --- Jungle ---
+
+	/** Frequency of jungle hills. Higher values give smaller, more frequent hills. */
+	float JungleHillsFrequency = 0.0002f;
+
+	/** Height difference between jungle hollows and hill tops deep inside a jungle cell. */
+	float JungleHillsHeight = 1400.0f;
+
+	/** Frequency of fine surface roughness in the jungle. */
+	float JungleDetailFrequency = 0.00025f;
+
+	/** Amplitude of fine surface roughness in the jungle. */
+	float JungleDetailAmplitude = 200.0f;
 
 	// --- Swamp ---
 
@@ -266,6 +348,12 @@ struct FTerrainGenerationSettings
 
 	/** Amplitude of fine surface roughness on mountains. */
 	float MountainsDetailAmplitude = 800.0f;
+
+	/** Frequency of fine surface roughness on foothills. Milder than the peaks. */
+	float FoothillsDetailFrequency = 0.00025f;
+
+	/** Amplitude of fine surface roughness on foothills. */
+	float FoothillsDetailAmplitude = 200.0f;
 
 	// --- Desert ---
 

@@ -247,3 +247,66 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Oasis", meta = (ClampMin = "0.0", Units = "cm"))
 	float OasisMaxDuneHeight = 1000.0f;
 };
+
+UCLASS(BlueprintType)
+class MPSURV_API UTundraBiomeDataAsset : public UBiomeDataAsset
+{
+	GENERATED_BODY()
+
+public:
+	UTundraBiomeDataAsset();
+
+	virtual void ApplyTo(FTerrainGenerationSettings& Settings) const override;
+
+	UPROPERTY(EditAnywhere, Category = "Tundra", meta = (ClampMin = "0.0"))
+	float TundraHillsFrequency = 0.00009f;
+
+	UPROPERTY(EditAnywhere, Category = "Tundra", meta = (ClampMin = "0.0", Units = "cm"))
+	float TundraHillsAmplitude = 400.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Tundra", meta = (ClampMin = "0.0"))
+	float TundraDetailFrequency = 0.00025f;
+
+	UPROPERTY(EditAnywhere, Category = "Tundra", meta = (ClampMin = "0.0", Units = "cm"))
+	float TundraDetailAmplitude = 200.0f;
+};
+
+UCLASS(BlueprintType)
+class MPSURV_API UJungleBiomeDataAsset : public UBiomeDataAsset
+{
+	GENERATED_BODY()
+
+public:
+	UJungleBiomeDataAsset();
+
+	virtual void ApplyTo(FTerrainGenerationSettings& Settings) const override;
+
+	UPROPERTY(EditAnywhere, Category = "Jungle", meta = (ClampMin = "0.00001", UIMin = "0.00005", UIMax = "0.001"))
+	float JungleHillsFrequency = 0.0002f;
+
+	UPROPERTY(EditAnywhere, Category = "Jungle", meta = (ClampMin = "0.0", UIMax = "5000.0", Units = "cm"))
+	float JungleHillsHeight = 1400.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Jungle", meta = (ClampMin = "0.0"))
+	float JungleDetailFrequency = 0.00025f;
+
+	UPROPERTY(EditAnywhere, Category = "Jungle", meta = (ClampMin = "0.0", Units = "cm"))
+	float JungleDetailAmplitude = 200.0f;
+};
+
+UCLASS(BlueprintType)
+class MPSURV_API UFoothillsBiomeDataAsset : public UBiomeDataAsset
+{
+	GENERATED_BODY()
+
+public:
+	UFoothillsBiomeDataAsset();
+
+	virtual void ApplyTo(FTerrainGenerationSettings& Settings) const override;
+
+	UPROPERTY(EditAnywhere, Category = "Foothills", meta = (ClampMin = "0.0"))
+	float FoothillsDetailFrequency = 0.00025f;
+
+	UPROPERTY(EditAnywhere, Category = "Foothills", meta = (ClampMin = "0.0", Units = "cm"))
+	float FoothillsDetailAmplitude = 200.0f;
+};
