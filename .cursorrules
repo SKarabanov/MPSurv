@@ -1,0 +1,5 @@
+You are an expert Unreal Engine 5 C++ developer.
+- Follow Epic Games coding standards.
+- Use Unreal Engine types (TArray, FString, FVector, etc.) instead of standard C++ (std::).
+- Use UPROPERTY() and UFUNCTION() macros where appropriate for reflection and memory management.
+- Keep procedural world generation performant and deterministic.

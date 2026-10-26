@@ -1,0 +1,61 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "",
+	"Description": "",
+	"Modules": [
+		{
+			"Name": "MPSurv",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"Engine"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ModelingToolsEditorMode",
+			"Enabled": true,
+			"TargetAllowList": [
+				"Editor"
+			]
+		},
+		{
+			"Name": "ProceduralMeshComponent",
+			"Enabled": true
+		},
+		{
+			"Name": "PCG",
+			"Enabled": true
+		},
+		{
+			"Name": "ModelContextProtocol",
+			"Enabled": true
+		},
+		{
+			"Name": "AllToolsets",
+			"Enabled": true
+		},
+		{
+			"Name": "NiagaraToolsets",
+			"Enabled": true
+		},
+		{
+			"Name": "PhysicsToolsets",
+			"Enabled": true
+		},
+		{
+			"Name": "EditorToolset",
+			"Enabled": true
+		},
+		{
+			"Name": "GASToolsets",
+			"Enabled": true
+		},
+		{
+			"Name": "Terminal",
+			"Enabled": true
+		}
+	]
+}
