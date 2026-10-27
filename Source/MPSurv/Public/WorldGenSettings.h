@@ -18,6 +18,8 @@ class MPSURV_API UWorldGenSettings : public UPrimaryDataAsset
 	GENERATED_BODY()
 
 public:
+	UWorldGenSettings();
+
 	virtual FPrimaryAssetId GetPrimaryAssetId() const override;
 
 	/** Writes this asset onto the POD snapshot the worker already receives. Missing asset keeps the struct defaults. */
@@ -68,37 +70,16 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
 	float BiomeWarpAmplitude = 120000.0f;
 
-	/** Sites closer than this to the world origin are plains. */
-	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float PlainsRadius = 200000.0f;
+	/**
+	 * Concentric rings. Each entry covers the land out to MaxRadius, and Biomes is the weighted draw inside it.
+	 * Add as many as the world needs. A point past every MaxRadius falls back to plains.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Biomes")
+	TArray<FRingZoneSettings> RingZones;
 
-	/** Kept so existing assets still load. The northern band is TundraLatitude. */
-	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (Units = "cm"))
-	float MountainLatitude = 400000.0f;
-
-	/** Warped Y below this is desert. */
+	/** Warped Y below this is desert to the west and jungle to the east. */
 	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (Units = "cm"))
 	float DesertLatitude = -400000.0f;
-
-	/** Inner radius of the forest ring. */
-	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float ForestMinRadius = 150000.0f;
-
-	/** Outer radius of the forest ring. */
-	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float ForestMaxRadius = 600000.0f;
-
-	/** Past this distance, and outside the forest ring, cells split between swamp and plateau. */
-	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float SwampPlateauRadius = 400000.0f;
-
-	/** Inner radius of the mountain ring. */
-	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float MountainMinRadius = 400000.0f;
-
-	/** Outer radius of the mountain ring. */
-	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float MountainMaxRadius = 550000.0f;
 
 	/** Warped Y above this is tundra. */
 	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (Units = "cm"))

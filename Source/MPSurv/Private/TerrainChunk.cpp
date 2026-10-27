@@ -1229,6 +1229,40 @@ void FTerrainGenerator::GetSeedOffsets(float& OutSeedLow, float& OutSeedHigh) co
 	OutSeedHigh = static_cast<float>((SeedBits >> 16) % 256);
 }
 
+namespace
+{
+	FBiomeWeight MakeBiomeWeight(EBiomeType Biome, float Weight)
+	{
+		FBiomeWeight Entry;
+		Entry.Biome = Biome;
+		Entry.Weight = Weight;
+		return Entry;
+	}
+
+	FRingZoneSettings MakeRing(float MaxRadius, TArray<FBiomeWeight> Biomes)
+	{
+		FRingZoneSettings Zone;
+		Zone.MaxRadius = MaxRadius;
+		Zone.Biomes = MoveTemp(Biomes);
+		return Zone;
+	}
+}
+
+TArray<FRingZoneSettings> FRingZoneSettings::MakeDefaults()
+{
+	TArray<FRingZoneSettings> Zones;
+	Zones.Add(MakeRing(200000.0f, { MakeBiomeWeight(EBiomeType::Plains, 1.0f) }));
+	Zones.Add(MakeRing(400000.0f, { MakeBiomeWeight(EBiomeType::Forest, 1.0f), MakeBiomeWeight(EBiomeType::Plains, 0.25f) }));
+	Zones.Add(MakeRing(600000.0f, { MakeBiomeWeight(EBiomeType::Mountains, 1.0f), MakeBiomeWeight(EBiomeType::Forest, 1.0f) }));
+	Zones.Add(MakeRing(100000000.0f, { MakeBiomeWeight(EBiomeType::Swamp, 1.0f), MakeBiomeWeight(EBiomeType::Plateau, 1.0f) }));
+	return Zones;
+}
+
+FTerrainGenerationSettings::FTerrainGenerationSettings()
+{
+	RingZones = FRingZoneSettings::MakeDefaults();
+}
+
 EBiomeType FTerrainGenerator::DetermineBiomeForCell(FVector2D CellCenter) const
 {
 	float SeedLow = 0.0f;
@@ -1261,34 +1295,59 @@ EBiomeType FTerrainGenerator::DetermineBiomeForCell(FVector2D CellCenter) const
 		return EBiomeType::Desert;
 	}
 
-	if (Dist > MountainMinRadius && Dist < MountainMaxRadius)
+	int32 RingIndex = INDEX_NONE;
+	float TightestRadius = TNumericLimits<float>::Max();
+	for (int32 Index = 0; Index < RingZones.Num(); ++Index)
 	{
-		return EBiomeType::Mountains;
+		const float Radius = RingZones[Index].MaxRadius;
+		if (Dist <= Radius && Radius < TightestRadius)
+		{
+			TightestRadius = Radius;
+			RingIndex = Index;
+		}
 	}
 
-	if (Dist < PlainsRadius)
+	if (RingIndex == INDEX_NONE)
 	{
 		return EBiomeType::Plains;
 	}
-	if (Dist >= ForestMinRadius && Dist <= ForestMaxRadius)
+
+	const TArray<FBiomeWeight>& Biomes = RingZones[RingIndex].Biomes;
+	float TotalWeight = 0.0f;
+	for (const FBiomeWeight& Entry : Biomes)
 	{
-		// Clearings: a high slice of a second noise, so most of the ring stays forest.
-		constexpr float ClearingFrequency = 0.000008f;
-		const float Clearing = FMath::PerlinNoise2D(FVector2D(X * ClearingFrequency + SeedLow + 53.0f, Y * ClearingFrequency + SeedHigh + 71.0f));
-		if (Clearing > 0.6f)
+		if (Entry.Weight > 0.0f)
 		{
-			return EBiomeType::Plains;
+			TotalWeight += Entry.Weight;
 		}
-		return EBiomeType::Forest;
 	}
-	if (Dist > SwampPlateauRadius)
+	if (TotalWeight <= 0.0f)
 	{
-		constexpr float SplitFrequency = 0.000003f;
-		const float Split = FMath::PerlinNoise2D(FVector2D(X * SplitFrequency + SeedHigh + 91.0f, Y * SplitFrequency + SeedLow + 113.0f));
-		return Split >= 0.0f ? EBiomeType::Swamp : EBiomeType::Plateau;
+		return EBiomeType::Plains;
 	}
 
-	return EBiomeType::Plains;
+	// One low-frequency sample, mapped to [0, 1], picks a slice of the ring's total weight.
+	constexpr float RingNoiseFrequency = 0.00004f;
+	const float RingNoise = FMath::PerlinNoise2D(FVector2D(X * RingNoiseFrequency + SeedLow + 53.0f, Y * RingNoiseFrequency + SeedHigh + 71.0f));
+	float Pick = (RingNoise + 1.0f) * 0.5f * TotalWeight;
+
+	EBiomeType Chosen = EBiomeType::Plains;
+	for (const FBiomeWeight& Entry : Biomes)
+	{
+		if (Entry.Weight <= 0.0f)
+		{
+			continue;
+		}
+
+		Chosen = Entry.Biome;
+		if (Pick <= Entry.Weight)
+		{
+			return Entry.Biome;
+		}
+		Pick -= Entry.Weight;
+	}
+
+	return Chosen;
 }
 
 

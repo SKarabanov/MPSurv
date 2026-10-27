@@ -2,6 +2,11 @@
 
 #include "WorldGenSettings.h"
 
+UWorldGenSettings::UWorldGenSettings()
+{
+	RingZones = FRingZoneSettings::MakeDefaults();
+}
+
 FPrimaryAssetId UWorldGenSettings::GetPrimaryAssetId() const
 {
 	return FPrimaryAssetId(TEXT("WorldGenSettings"), GetFName());
@@ -21,14 +26,8 @@ void UWorldGenSettings::ApplyTo(FTerrainGenerationSettings& Settings) const
 	Settings.CenterPlainsRadius = CenterPlainsRadius;
 	Settings.BiomeFalloffRadius = BiomeFalloffRadius;
 	Settings.BiomeWarpAmplitude = BiomeWarpAmplitude;
-	Settings.PlainsRadius = PlainsRadius;
-	Settings.MountainLatitude = MountainLatitude;
+	Settings.RingZones = RingZones;
 	Settings.DesertLatitude = DesertLatitude;
-	Settings.ForestMinRadius = ForestMinRadius;
-	Settings.ForestMaxRadius = ForestMaxRadius;
-	Settings.SwampPlateauRadius = SwampPlateauRadius;
-	Settings.MountainMinRadius = MountainMinRadius;
-	Settings.MountainMaxRadius = MountainMaxRadius;
 	Settings.TundraLatitude = TundraLatitude;
 	Settings.JungleLongitude = JungleLongitude;
 	Settings.FoothillsMaxHeight = FoothillsMaxHeight;

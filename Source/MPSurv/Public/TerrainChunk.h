@@ -62,6 +62,39 @@ struct FBiomeSite
 	float Distance = 0.0f;
 };
 
+/** One biome and its share of a ring. A higher weight claims a larger slice of that ring's noise. */
+USTRUCT(BlueprintType)
+struct FBiomeWeight
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome")
+	EBiomeType Biome = EBiomeType::Plains;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome", meta = (ClampMin = "0.0"))
+	float Weight = 1.0f;
+};
+
+/**
+ * Land from the previous ring's MaxRadius out to this one. Biomes lists who may appear here and how often.
+ * Rings are tested from the smallest MaxRadius outward, so the array order in the asset does not matter.
+ */
+USTRUCT(BlueprintType)
+struct FRingZoneSettings
+{
+	GENERATED_BODY()
+
+	/** Outer edge of this ring, in centimetres from the world origin. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome", meta = (ClampMin = "0.0", Units = "cm"))
+	float MaxRadius = 200000.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome")
+	TArray<FBiomeWeight> Biomes;
+
+	/** Plains, then forest with clearings, then mountains and forest, then swamp and plateau out to 1000 km. */
+	static TArray<FRingZoneSettings> MakeDefaults();
+};
+
 /** Everything a client needs to rebuild a chunk deterministically. Replicated as one unit. */
 USTRUCT(BlueprintType)
 struct FChunkInitData
@@ -92,6 +125,8 @@ USTRUCT(BlueprintType)
 struct FTerrainGenerationSettings
 {
 	GENERATED_BODY()
+
+	FTerrainGenerationSettings();
 
 	// --- Mesh / shading ---
 
@@ -158,37 +193,16 @@ struct FTerrainGenerationSettings
 	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
 	float BiomeWarpAmplitude = 120000.0f;
 
-	/** Sites closer than this to the world origin are plains. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float PlainsRadius = 200000.0f;
+	/**
+	 * Concentric rings, each with its own biome weights. The fallback when no world-settings asset is loaded.
+	 * Filled in the constructor so a missing asset still has a playable layout.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes")
+	TArray<FRingZoneSettings> RingZones;
 
-	/** Kept so existing assets still load. The northern band is TundraLatitude. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (Units = "cm"))
-	float MountainLatitude = 400000.0f;
-
-	/** Warped Y below this is desert. */
+	/** Warped Y below this is desert to the west and jungle to the east. */
 	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (Units = "cm"))
 	float DesertLatitude = -400000.0f;
-
-	/** Inner radius of the forest ring. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float ForestMinRadius = 150000.0f;
-
-	/** Outer radius of the forest ring. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float ForestMaxRadius = 600000.0f;
-
-	/** Past this distance, and outside the forest ring, cells split between swamp and plateau. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float SwampPlateauRadius = 400000.0f;
-
-	/** Inner radius of the mountain ring. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float MountainMinRadius = 400000.0f;
-
-	/** Outer radius of the mountain ring. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float MountainMaxRadius = 550000.0f;
 
 	/** Warped Y above this is tundra. */
 	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (Units = "cm"))
