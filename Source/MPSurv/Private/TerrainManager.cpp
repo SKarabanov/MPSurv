@@ -2,6 +2,7 @@
 
 #include "TerrainManager.h"
 
+#include "CoreGlobals.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -90,6 +91,56 @@ const TArray<FBiomeGrassEntry>& ATerrainManager::GetGrassEntries() const
 {
 	EnsureGenerationAssetsLoaded();
 	return ResolvedGrass;
+}
+
+bool ATerrainManager::TryConsumeVisualLODRebuild(ATerrainChunk* Chunk)
+{
+	if (!IsValid(Chunk))
+	{
+		return false;
+	}
+
+	VisualLODRebuildOwners.RemoveAll([](const TWeakObjectPtr<ATerrainChunk>& HeldChunk)
+	{
+		return !HeldChunk.IsValid();
+	});
+
+	for (const TWeakObjectPtr<ATerrainChunk>& HeldChunk : VisualLODRebuildOwners)
+	{
+		if (HeldChunk.Get() == Chunk)
+		{
+			return false;
+		}
+	}
+
+	const int32 Budget = FMath::Max(MaxVisualLODRebuildsPerFrame, 1);
+	if (VisualLODRebuildOwners.Num() >= Budget)
+	{
+		return false;
+	}
+
+	if (VisualLODBudgetFrame != GFrameCounter)
+	{
+		VisualLODBudgetFrame = GFrameCounter;
+		VisualLODRebuildsThisFrame = 0;
+	}
+
+	if (VisualLODRebuildsThisFrame >= Budget)
+	{
+		return false;
+	}
+
+	++VisualLODRebuildsThisFrame;
+	VisualLODRebuildOwners.Add(Chunk);
+	return true;
+}
+
+void ATerrainManager::ReleaseVisualLODRebuild(ATerrainChunk* Chunk)
+{
+	VisualLODRebuildOwners.RemoveAll([Chunk](const TWeakObjectPtr<ATerrainChunk>& HeldChunk)
+	{
+		return !HeldChunk.IsValid() || HeldChunk.Get() == Chunk;
+	});
 }
 
 void ATerrainManager::EnsureGenerationAssetsLoaded() const
@@ -531,6 +582,7 @@ ATerrainChunk* ATerrainManager::AcquireChunk(const FIntPoint& Coords)
 		}
 
 		const FVector ChunkLocation(Coords.X * ChunkWorldSize, Coords.Y * ChunkWorldSize, 0.0f);
+		Pooled->PrepareChunkForTeleport();
 		Pooled->SetActorLocation(ChunkLocation);
 		Pooled->SetActorHiddenInGame(false);
 		return Pooled;

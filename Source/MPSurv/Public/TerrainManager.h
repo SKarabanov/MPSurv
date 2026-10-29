@@ -49,6 +49,17 @@ public:
 	/** Radius, in chunks, inside which a pawn keeps physical collision. Shared by the server and by clients. */
 	int32 GetCollisionRadiusInChunks() const { return CollisionRadiusInChunks; }
 
+	/**
+	 * Game thread, every rendering machine. At most MaxVisualLODRebuildsPerFrame visual LOD rebuilds may start on
+	 * one frame, and that many may be in flight. The slot stays taken until the rebuild reaches ApplyMesh, so
+	 * finished workers cannot upload on the same frame. Collision rebuilds and the first mesh of a chunk do not
+	 * call this. Returns false when the caller should retry next tick without changing its LOD.
+	 */
+	bool TryConsumeVisualLODRebuild(ATerrainChunk* Chunk);
+
+	/** Drops the visual LOD slot held by Chunk. A second release, or one from a chunk that holds none, is ignored. */
+	void ReleaseVisualLODRebuild(ATerrainChunk* Chunk);
+
 	/** Spawns up to ChunksPerFrame chunks from GenerationQueue; switches itself off once the queue is empty. */
 	virtual void Tick(float DeltaTime) override;
 
@@ -175,6 +186,13 @@ protected:
 		EditCondition = "SpawnMode == ETerrainSpawnMode::DynamicStreaming", EditConditionHides))
 	int32 PreSpawnRadius = 2;
 
+	/**
+	 * Visual LOD rebuilds that may start on one frame, per rendering machine. Each one keeps its slot until the
+	 * mesh is uploaded, so a burst of chunks crossing a LOD distance cannot recreate their proxies together.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD", meta = (ClampMin = "1"))
+	int32 MaxVisualLODRebuildsPerFrame = 1;
+
 private:
 	UPROPERTY(Transient)
 	TMap<FIntPoint, TObjectPtr<ATerrainChunk>> ActiveChunks;
@@ -187,6 +205,15 @@ private:
 	TArray<FIntPoint> GenerationQueue;
 
 	FTimerHandle StreamingTimerHandle;
+
+	/** Chunks whose visual LOD rebuild has started and not yet reached ApplyMesh. */
+	TArray<TWeakObjectPtr<ATerrainChunk>> VisualLODRebuildOwners;
+
+	/** GFrameCounter of the frame VisualLODRebuildsThisFrame counts. */
+	uint64 VisualLODBudgetFrame = 0;
+
+	/** Visual LOD rebuilds started on VisualLODBudgetFrame. */
+	int32 VisualLODRebuildsThisFrame = 0;
 
 	/** Hard refs so the loaded assets and their grass meshes are not collected after the synchronous load. */
 	mutable TStrongObjectPtr<UWorldGenSettings> LoadedWorldGenSettings;

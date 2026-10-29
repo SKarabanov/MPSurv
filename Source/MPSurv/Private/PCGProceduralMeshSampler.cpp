@@ -13,17 +13,12 @@
 #include "Metadata/Accessors/PCGCustomAccessor.h"
 #include "ProceduralMeshComponent.h"
 #include "Modules/ModuleManager.h"
+#include "TerrainChunk.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogPCGProceduralMeshSampler, Log, All);
 
 namespace PCGProceduralMeshSamplerPrivate
 {
-	/** Visual terrain section. This is LOD 0 when the chunk is not also keeping a hidden collision mesh. */
-	constexpr int32 TerrainSectionIndex = 0;
-
-	/** Hidden full-resolution terrain. Present when the visible mesh is a coarser LOD. */
-	constexpr int32 CollisionSectionIndex = 2;
-
 	const FName BiomeIdAttributeName(TEXT("BiomeId"));
 	const FName NormalPropertyName(TEXT("Normal"));
 
@@ -56,7 +51,7 @@ namespace PCGProceduralMeshSamplerPrivate
 			return nullptr;
 		}
 
-		if (const FProcMeshSection* CollisionSection = Mesh->GetProcMeshSection(CollisionSectionIndex))
+		if (const FProcMeshSection* CollisionSection = Mesh->GetProcMeshSection(ATerrainChunk::CollisionSectionIndex))
 		{
 			if (CollisionSection->ProcVertexBuffer.Num() > 0)
 			{
@@ -64,10 +59,14 @@ namespace PCGProceduralMeshSamplerPrivate
 			}
 		}
 
-		const FProcMeshSection* TerrainSection = Mesh->GetProcMeshSection(TerrainSectionIndex);
-		if (TerrainSection && TerrainSection->ProcVertexBuffer.Num() > 0)
+		// Section 0 is always LOD 0 and is hidden while a coarser LOD is showing. Sample the visible one.
+		for (int32 LOD = 0; LOD < ATerrainChunk::NumLODs; ++LOD)
 		{
-			return TerrainSection;
+			const FProcMeshSection* TerrainSection = Mesh->GetProcMeshSection(ATerrainChunk::TerrainSectionIndexForLOD(LOD));
+			if (TerrainSection && TerrainSection->bSectionVisible && TerrainSection->ProcVertexBuffer.Num() > 0)
+			{
+				return TerrainSection;
+			}
 		}
 
 		return nullptr;

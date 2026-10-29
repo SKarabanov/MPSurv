@@ -563,11 +563,20 @@ struct FTerrainBuildRequest
 	/** Dedicated server: a single collision-only terrain section, no skirts, no water. */
 	bool bDedicatedServer = false;
 
-	/** The terrain section carries collision itself (its grid is LOD 0). */
+	/** The terrain section carries collision itself (its grid is LOD 0). Dedicated server only. */
 	bool bTerrainCollision = false;
 
-	/** Also build a hidden LOD 0 grid for collision, because the visual LOD is coarser. */
+	/** Build a hidden LOD 0 section for collision. Visual LOD sections never carry collision. */
 	bool bCollisionGrid = false;
+
+	/**
+	 * Rendering machines: build LOD 0, 1 and 2, each with its own water section, in this one build.
+	 * Later LOD changes only toggle section visibility.
+	 */
+	bool bBuildAllVisualLODs = false;
+
+	/** Visual sections are already uploaded. This build only creates or clears the hidden collision section. */
+	bool bUpdateCollisionOnly = false;
 
 	/**
 	 * Grass placement rules for the worker. Empty on a dedicated server or when the actor has no grass entries.
@@ -584,11 +593,17 @@ struct FTerrainBuildResult
 {
 	FTerrainMeshBuffers Terrain;
 
+	/** One entry per visual LOD when the request built every LOD. Empty for a dedicated server and for partial updates. */
+	TArray<FTerrainMeshBuffers> TerrainLODs;
+
 	/** Empty unless the request asked for a collision grid. */
 	FTerrainMeshBuffers Collision;
 
 	/** Empty on a dedicated server or where no water reaches the chunk. */
 	FTerrainMeshBuffers Water;
+
+	/** One water mesh per visual LOD, parallel to TerrainLODs. An entry with no triangles is a dry LOD. */
+	TArray<FTerrainMeshBuffers> WaterLODs;
 
 	/**
 	 * Grass instance transforms in actor-local space, keyed by biome ID.
@@ -639,6 +654,23 @@ public:
 	static_assert(static_cast<float>(QuadsPerSide) * CellSize == ChunkWorldSize, "CellSize must divide ChunkWorldSize evenly.");
 	static_assert(QuadsPerSide % (1 << (NumLODs - 1)) == 0, "QuadsPerSide must stay divisible by every LOD reduction.");
 
+	/** Hidden LOD 0 collision. PCG prefers this section while it has vertices. */
+	static constexpr int32 CollisionSectionIndex = 2;
+
+	/** Visual terrain. LOD 0 stays in section 0; LOD 1 and 2 sit past the collision section. */
+	static int32 TerrainSectionIndexForLOD(int32 LOD)
+	{
+		const int32 ClampedLOD = FMath::Clamp(LOD, 0, NumLODs - 1);
+		return ClampedLOD == 0 ? 0 : ClampedLOD + 2;
+	}
+
+	/** Water for the same LOD. LOD 0 stays in section 1. */
+	static int32 WaterSectionIndexForLOD(int32 LOD)
+	{
+		const int32 ClampedLOD = FMath::Clamp(LOD, 0, NumLODs - 1);
+		return ClampedLOD == 0 ? 1 : ClampedLOD + 4;
+	}
+
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	/** Server-only. Assigns init data and starts the first mesh build (synchronous if InData.bForceSynchronous). */
@@ -651,6 +683,9 @@ public:
 	 * and a reuse that arrives while it is still set raises bRegenerationPending from GenerateTerrainMesh.
 	 */
 	void ResetChunkState();
+
+	/** Movable for a pooled teleport. SetActorLocation on a Stationary chunk does not move it. */
+	void PrepareChunkForTeleport();
 
 	/** Biome-blended elevation with rivers, streams and lakes, plus surface detail. Game thread. */
 	UFUNCTION(BlueprintCallable, Category = "Terrain")
@@ -666,11 +701,11 @@ public:
 	static FTerrainBuildResult CalculateTerrainData(FChunkInitData InInitData, float InCellSize, int32 InQuadsPerSide, const FTerrainBuildRequest& Request);
 
 	/**
-	 * Rebuilds the mesh for the current LOD and collision state. Rendering machines get terrain with skirts in
-	 * section 0 and water in section 1; a dedicated server only builds collision geometry, and only while
-	 * collision is enabled. The heavy work runs on a worker unless this is the first build of a chunk with
-	 * bForceSynchronous. A request made while a build is running is replayed once that build is applied.
-	 * Skipped while InitData.Seed is 0.
+	 * Rebuilds the mesh for the current collision state. The first client build uploads every visual LOD and
+	 * its water; later LOD changes only toggle section visibility. A dedicated server only builds collision
+	 * geometry, and only while collision is enabled. The heavy work runs on a worker unless this is the first
+	 * build of a chunk with bForceSynchronous. A request made while a build is running is replayed once that
+	 * build is applied. Skipped while InitData.Seed is 0.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Terrain")
 	void GenerateTerrainMesh();
@@ -708,8 +743,29 @@ protected:
 	UFUNCTION()
 	void OnRep_InitData();
 
-	/** LOD timer callback on rendering machines: rebuilds the mesh when the camera crosses a LOD distance. */
+	/** LOD timer callback on rendering machines: shows the section for the camera distance. */
 	void UpdateVisualLOD();
+
+	/** Shows one terrain LOD and its water section. Does not recreate the scene proxy. */
+	void ApplyVisualLODVisibility(int32 LOD);
+
+	/** Stationary after the mesh upload, so a resting chunk leaves the dynamic visibility path. */
+	void SettleChunkMobility();
+
+	/** Creates or clears the hidden collision section. Create and clear recreate the scene proxy. */
+	void ApplyCollisionSection(const FTerrainMeshBuffers& Collision, bool bEnable);
+
+	/** Fills grass HISMs from a finished build. Does not touch mesh sections. */
+	void ApplyGrassInstances(const FTerrainBuildResult& Result);
+
+	/** Copies grass rules when the shown LOD is 0 and this InitData has not built grass yet. */
+	void PopulateGrassRequest(FTerrainBuildRequest& Request) const;
+
+	/** One next-tick retry while the manager's visual LOD budget is full. Further requests on the same frame are dropped. */
+	void DeferVisualLODRetry();
+
+	/** Returns the visual LOD budget slot held by this chunk, if any. */
+	void ReleaseVisualLODSlot();
 
 	/**
 	 * LOD for the current local camera distance, or CurrentLOD if there is no camera yet.
@@ -789,6 +845,9 @@ private:
 	/** Prevents BeginPlay from rebuilding a mesh already produced by OnRep_InitData. */
 	bool bHasGeneratedMesh = false;
 
+	/** Client mesh already holds every visual LOD. Further LOD changes only toggle visibility. */
+	bool bVisualLODsReady = false;
+
 	/** PCG runs once per InitData, not on every LOD rebuild. */
 	bool bPCGGenerated = false;
 
@@ -800,6 +859,16 @@ private:
 
 	/** Visual LOD of the current mesh. Always 0 on a dedicated server. */
 	int32 CurrentLOD = 0;
+
+	/** This chunk has taken a visual LOD budget slot that ReleaseVisualLODSlot has not yet returned. */
+	bool bHoldsVisualLODSlot = false;
+
+	/** GFrameCounter of the last deferred visual LOD retry. Stops the same frame from queueing more than one. */
+	uint64 VisualLODRetryFrame = 0;
+
+	bool bVisualLODRetryScheduled = false;
+
+	FTimerHandle VisualLODRetryHandle;
 
 	/** Collision flag last uploaded by ApplyMesh. Clients compare it when the pawn crosses CollisionRadiusInChunks. */
 	bool bCollisionApplied = false;
