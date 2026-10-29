@@ -23,17 +23,12 @@ void UWorldGenSettings::ApplyTo(FTerrainGenerationSettings& Settings) const
 	Settings.StartIslandStrength = StartIslandStrength;
 	Settings.StraitFreeRadius = StraitFreeRadius;
 	Settings.BiomeCellSize = BiomeCellSize;
-	Settings.CenterPlainsRadius = CenterPlainsRadius;
-	Settings.BiomeFalloffRadius = BiomeFalloffRadius;
 	Settings.BiomeWarpAmplitude = BiomeWarpAmplitude;
 	Settings.RingZones = RingZones;
 	Settings.DesertLatitude = DesertLatitude;
 	Settings.TundraLatitude = TundraLatitude;
 	Settings.JungleLongitude = JungleLongitude;
 	Settings.FoothillsMaxHeight = FoothillsMaxHeight;
-	Settings.DesertRegionMinSize = DesertRegionMinSize;
-	Settings.DesertRegionMaxSize = DesertRegionMaxSize;
-	Settings.DesertRegionChance = DesertRegionChance;
 	Settings.OasisGridSize = OasisGridSize;
 	Settings.RiverFrequency = RiverFrequency;
 	Settings.RiverWidth = RiverWidth;

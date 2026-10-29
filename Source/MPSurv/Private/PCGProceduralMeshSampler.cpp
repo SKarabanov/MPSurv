@@ -9,7 +9,10 @@
 #include "Metadata/PCGMetadata.h"
 #include "Metadata/PCGMetadataAttributeTpl.h"
 #include "Metadata/PCGMetadataDomain.h"
+#include "Metadata/Accessors/PCGAttributeAccessorFactory.h"
+#include "Metadata/Accessors/PCGCustomAccessor.h"
 #include "ProceduralMeshComponent.h"
+#include "Modules/ModuleManager.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogPCGProceduralMeshSampler, Log, All);
 
@@ -22,6 +25,29 @@ namespace PCGProceduralMeshSamplerPrivate
 	constexpr int32 CollisionSectionIndex = 2;
 
 	const FName BiomeIdAttributeName(TEXT("BiomeId"));
+	const FName NormalPropertyName(TEXT("Normal"));
+
+	/**
+	 * Surface vertices are the row-major grid written first: (QuadsPerSide + 1)^2 for that section's LOD.
+	 * Skirts and the later biome-corner copies are appended after it, so the prefix is the ground.
+	 */
+	int32 CountSurfaceVertices(const TArray<FProcMeshVertex>& Vertices)
+	{
+		if (Vertices.Num() == 0)
+		{
+			return 0;
+		}
+
+		const double RowY = Vertices[0].Position.Y;
+		int32 VerticesPerSide = 1;
+		while (VerticesPerSide < Vertices.Num() && FMath::IsNearlyEqual(Vertices[VerticesPerSide].Position.Y, RowY, 1.0))
+		{
+			++VerticesPerSide;
+		}
+
+		const int32 SurfaceCount = VerticesPerSide * VerticesPerSide;
+		return FMath::Clamp(SurfaceCount, 1, Vertices.Num());
+	}
 
 	const FProcMeshSection* FindTerrainSection(UProceduralMeshComponent* Mesh)
 	{
@@ -72,6 +98,18 @@ namespace PCGProceduralMeshSamplerPrivate
 	{
 		return VertexColor.B >= 128 ? VertexColor.G : VertexColor.R;
 	}
+
+	TUniquePtr<const IPCGAttributeAccessor> CreateNormalAccessor(const UPCGBasePointData* PointData)
+	{
+		return MakeUnique<FPCGCustomPointPropertyAccessor<FVector, FPCGPointTransform::ConstValueRange>>(
+			PointData,
+			[](int32 Index, FVector& OutValue, const FPCGPointTransform::ConstValueRange& Transform)
+			{
+				OutValue = Transform[Index].GetUnitAxis(EAxis::Z);
+				return true;
+			},
+			PointData->GetConstTransformValueRange());
+	}
 }
 
 class FPCGProceduralMeshSamplerElement : public IPCGElement
@@ -112,7 +150,7 @@ FText UPCGProceduralMeshSamplerSettings::GetDefaultNodeTitle() const
 FText UPCGProceduralMeshSamplerSettings::GetNodeTooltipText() const
 {
 	return NSLOCTEXT("PCGProceduralMeshSampler", "NodeTooltip",
-		"Samples vertices of a dynamic procedural mesh. Point Color is the vertex color. BiomeId is the dominant packed biome.");
+		"Samples the terrain grid of a dynamic procedural mesh, skipping skirt vertices. $Normal is the vertex normal, and the point rotation Z matches it. BiomeId is the dominant packed biome.");
 }
 
 EPCGSettingsType UPCGProceduralMeshSamplerSettings::GetType() const
@@ -137,7 +175,7 @@ TArray<FPCGPinProperties> UPCGProceduralMeshSamplerSettings::OutputPinProperties
 	Pins.Emplace(PCGPinConstants::DefaultOutputLabel, FPCGDataTypeIdentifier{EPCGDataType::Point},
 		/*bAllowMultipleConnections=*/true, /*bAllowMultipleData=*/true,
 		NSLOCTEXT("PCGProceduralMeshSampler", "OutputPinTooltip",
-			"One point per terrain vertex. Color is the vertex color, BiomeId is the dominant biome."));
+			"One point per surface vertex. Normal is the vertex normal, and the point rotation Z matches it. BiomeId is the dominant biome."));
 	return Pins;
 }
 
@@ -185,16 +223,17 @@ bool FPCGProceduralMeshSamplerElement::ExecuteInternal(FPCGContext* Context) con
 		}
 
 		const TArray<FProcMeshVertex> Vertices = Section->ProcVertexBuffer;
+		const int32 SurfaceCount = CountSurfaceVertices(Vertices);
 		const FTransform MeshToWorld = Mesh->GetComponentTransform();
 
-		UPCGBasePointData* PointData = FPCGContext::NewPointData_AnyThread(Context);
+		UPCGBasePointData* PointData = FPCGContext::NewObject_AnyThread<UMPSurvTerrainPointData>(Context);
 		if (!PointData)
 		{
 			UE_LOG(LogPCGProceduralMeshSampler, Warning, TEXT("PCG_ProceduralMeshSampler: failed to allocate point data."));
 			continue;
 		}
 
-		PointData->SetNumPoints(Vertices.Num());
+		PointData->SetNumPoints(SurfaceCount);
 		PointData->AllocateProperties(EPCGPointNativeProperties::All);
 
 		UPCGMetadata* Metadata = PointData->MutableMetadata();
@@ -216,21 +255,31 @@ bool FPCGProceduralMeshSamplerElement::ExecuteInternal(FPCGContext* Context) con
 		TPCGValueRange<FVector4> Colors = PointData->GetColorValueRange(/*bAllocate=*/true);
 		TPCGValueRange<int64> MetadataEntries = PointData->GetMetadataEntryValueRange(/*bAllocate=*/true);
 
-		for (int32 VertexIndex = 0; VertexIndex < Vertices.Num(); ++VertexIndex)
+		for (int32 VertexIndex = 0; VertexIndex < SurfaceCount; ++VertexIndex)
 		{
 			const FProcMeshVertex& Vertex = Vertices[VertexIndex];
 			const FLinearColor LinearColor = Vertex.Color.ReinterpretAsLinear();
 
-			Transforms[VertexIndex] = FTransform(MeshToWorld.TransformPosition(Vertex.Position));
+			FVector WorldNormal = MeshToWorld.TransformVectorNoScale(Vertex.Normal).GetSafeNormal();
+			if (WorldNormal.IsNearlyZero())
+			{
+				WorldNormal = FVector::UpVector;
+			}
+
+			const FVector WorldPosition = MeshToWorld.TransformPosition(Vertex.Position);
+			Transforms[VertexIndex] = FTransform(FRotationMatrix::MakeFromZ(WorldNormal).ToQuat(), WorldPosition);
 			Densities[VertexIndex] = 1.0f;
 			Seeds[VertexIndex] = VertexIndex;
 			Colors[VertexIndex] = FVector4(LinearColor.R, LinearColor.G, LinearColor.B, LinearColor.A);
 
-			if (ElementsDomain && BiomeAttribute && MetadataEntries.IsValidIndex(VertexIndex))
+			if (ElementsDomain && MetadataEntries.IsValidIndex(VertexIndex))
 			{
 				MetadataEntries[VertexIndex] = PCGInvalidEntryKey;
 				ElementsDomain->InitializeOnSet(MetadataEntries[VertexIndex]);
-				BiomeAttribute->SetValue(MetadataEntries[VertexIndex], static_cast<int32>(DecodeDominantBiome(Vertex.Color)));
+				if (BiomeAttribute)
+				{
+					BiomeAttribute->SetValue(MetadataEntries[VertexIndex], static_cast<int32>(DecodeDominantBiome(Vertex.Color)));
+				}
 			}
 		}
 
@@ -240,4 +289,47 @@ bool FPCGProceduralMeshSamplerElement::ExecuteInternal(FPCGContext* Context) con
 	}
 
 	return true;
+}
+
+UPCGSpatialData* UMPSurvTerrainPointData::CopyInternal(FPCGContext* Context) const
+{
+	UMPSurvTerrainPointData* NewPointData = FPCGContext::NewObject_AnyThread<UMPSurvTerrainPointData>(Context);
+	if (NewPointData && !SupportsSpatialDataInheritance())
+	{
+		const int32 NumPoints = GetNumPoints();
+		NewPointData->SetNumPoints(NumPoints, /*bInitializeValues=*/false);
+		CopyPropertiesTo(NewPointData, 0, 0, NumPoints, EPCGPointNativeProperties::All);
+	}
+
+	return NewPointData;
+}
+
+void RegisterMPSurvTerrainPointAccessors()
+{
+	FModuleManager::Get().LoadModuleChecked(TEXT("PCG"));
+
+	FPCGAttributeAccessorMethods Methods;
+	Methods.CreateConstAccessorFunc = [](const UPCGData* InData, const FPCGAttributePropertySelector& InSelector, bool) -> TUniquePtr<const IPCGAttributeAccessor>
+	{
+		if (InSelector.GetSelection() != EPCGAttributePropertySelection::Property
+			|| InSelector.GetPropertyName() != PCGProceduralMeshSamplerPrivate::NormalPropertyName)
+		{
+			return {};
+		}
+
+		const UPCGBasePointData* PointData = Cast<UPCGBasePointData>(InData);
+		return PointData ? PCGProceduralMeshSamplerPrivate::CreateNormalAccessor(PointData) : TUniquePtr<const IPCGAttributeAccessor>();
+	};
+
+	FPCGAttributeAccessorFactory::GetMutableInstance().RegisterMethods<UMPSurvTerrainPointData>(MoveTemp(Methods));
+}
+
+void UnregisterMPSurvTerrainPointAccessors()
+{
+	if (!FModuleManager::Get().IsModuleLoaded(TEXT("PCG")))
+	{
+		return;
+	}
+
+	FPCGAttributeAccessorFactory::GetMutableInstance().UnregisterMethods<UMPSurvTerrainPointData>();
 }

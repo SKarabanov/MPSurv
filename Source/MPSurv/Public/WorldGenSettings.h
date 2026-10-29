@@ -8,7 +8,7 @@
 #include "WorldGenSettings.generated.h"
 
 /**
- * Shared world shape: continentalness, the start island, the Voronoi layout, desert regions, oasis spacing and rivers.
+ * Shared world shape: continentalness, the start island, the Voronoi layout, oasis spacing and rivers.
  * One asset for the whole world. Per-biome shape lives on UBiomeDataAsset. The game thread copies these numbers into
  * FTerrainGenerationSettings before a chunk build; the worker never sees this asset.
  */
@@ -60,12 +60,6 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "1000.0", Units = "cm"))
 	float BiomeCellSize = 60000.0f;
 
-	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float CenterPlainsRadius = 15000.0f;
-
-	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "1.0", Units = "cm"))
-	float BiomeFalloffRadius = 150000.0f;
-
 	/** How far a low-frequency warp shifts a site before distance and latitude are measured. */
 	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
 	float BiomeWarpAmplitude = 120000.0f;
@@ -92,21 +86,6 @@ public:
 	/** Mountain ground below this height is written as foothills. */
 	UPROPERTY(EditAnywhere, Category = "Biomes", meta = (ClampMin = "0.0", Units = "cm"))
 	float FoothillsMaxHeight = 8000.0f;
-
-	/**
-	 * Smallest desert across. Every biome cell whose site falls in a desert region becomes desert, so a desert is
-	 * at least one cell (BiomeCellSize) even when this is smaller.
-	 */
-	UPROPERTY(EditAnywhere, Category = "Desert Regions", meta = (ClampMin = "0.0", Units = "cm"))
-	float DesertRegionMinSize = 60000.0f;
-
-	/** Largest desert across. Desert regions are spaced 1.5x this apart, so larger deserts are also sparser. */
-	UPROPERTY(EditAnywhere, Category = "Desert Regions", meta = (ClampMin = "1000.0", Units = "cm"))
-	float DesertRegionMaxSize = 200000.0f;
-
-	/** Chance that a desert region exists in the outer world; it fades out towards the start island. */
-	UPROPERTY(EditAnywhere, Category = "Desert Regions", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float DesertRegionChance = 0.6f;
 
 	/** Spacing of the grid on which oasis candidates are placed, one per cell. */
 	UPROPERTY(EditAnywhere, Category = "Oasis", meta = (ClampMin = "1000.0", Units = "cm"))

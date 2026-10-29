@@ -57,5 +57,8 @@
 			"Name": "Terminal",
 			"Enabled": true
 		}
+	],
+	"TargetPlatforms": [
+		"Windows"
 	]
 }

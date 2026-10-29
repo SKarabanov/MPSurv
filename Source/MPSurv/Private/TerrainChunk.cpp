@@ -62,13 +62,6 @@ namespace TerrainChunkPrivate
 	constexpr float PlateauEscarpmentStartCm = 2000.0f;
 	constexpr float PlateauEscarpmentEndCm = 9000.0f;
 
-	// Desert regions lie on a grid 1.5x their largest size, one candidate per grid cell.
-	constexpr float DesertRegionSpacingScale = 1.5f;
-
-	// Farthest the nearest biome site can be from any point, in biome cells: a cell corner with all four
-	// neighbouring sites jittered to their far extreme.
-	constexpr float MaxNearestSiteDistance = 1.25f;
-
 	// Power applied to the ridged dune noise: widens the hollows and sharpens the crests.
 	constexpr float DesertDuneSharpness = 2.0f;
 
@@ -804,12 +797,6 @@ private:
 	/** Jittered Voronoi site of a biome cell. */
 	FVector2D GetBiomeSite(int32 CellX, int32 CellY) const;
 
-	/** Voronoi site nearest to a point, without drawing any biome. */
-	FVector2D FindNearestBiomeSite(const FVector2D& Point) const;
-
-	/** Whether a biome site lies in a desert region: a disc between DesertRegionMinSize and MaxSize across. */
-	bool IsInDesertRegion(const FVector2D& Site) const;
-
 	/** Scans the Voronoi sites around a point; optionally returns every site that blends into it. */
 	FBiomeContext QueryBiomeSites(float WorldX, float WorldY, TArray<FBiomeSite, TInlineAllocator<8>>* OutBlendSites) const;
 
@@ -922,6 +909,9 @@ ATerrainChunk::ATerrainChunk()
 	ProceduralMesh->bUseAsyncCooking = true;
 	ProceduralMesh->bUseComplexAsSimpleCollision = true;
 	ProceduralMesh->SetCollisionProfileName(TEXT("BlockAll"));
+	// Primitives start with CastShadow off. Dynamic shadow is the CSM/VSM caster flag; receivers are shaded in the base pass.
+	ProceduralMesh->SetCastShadow(true);
+	ProceduralMesh->bCastDynamicShadow = true;
 
 	// PCG stays idle until GeneratePCG: the chunk has no surface to scatter on before its first mesh build.
 	PCGComponent = CreateDefaultSubobject<UPCGComponent>(TEXT("PCGComponent"));
@@ -964,6 +954,10 @@ void ATerrainChunk::ResetChunkState()
 		if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = HISMPair.Value.Get(); IsValid(GrassHISM))
 		{
 			GrassHISM->ClearInstances();
+			if (GrassHISM->IsRegistered())
+			{
+				GrassHISM->UnregisterComponent();
+			}
 		}
 	}
 	bGrassBuilt = false;
@@ -971,7 +965,7 @@ void ATerrainChunk::ResetChunkState()
 
 	if (IsValid(PCGComponent))
 	{
-		PCGComponent->CleanupLocal(/*bRemoveComponents=*/true);
+		PCGComponent->CleanupLocalImmediate(/*bRemoveComponents=*/true);
 	}
 }
 
@@ -1004,7 +998,7 @@ void ATerrainChunk::InitializeChunk(const FChunkInitData& InData)
 	ClearAllGrassInstances();
 	if (IsValid(PCGComponent))
 	{
-		PCGComponent->CleanupLocal(/*bRemoveComponents=*/true);
+		PCGComponent->CleanupLocalImmediate(/*bRemoveComponents=*/true);
 	}
 
 	CurrentLOD = ComputeTargetLOD(false);
@@ -1059,7 +1053,7 @@ void ATerrainChunk::OnRep_InitData()
 	}
 	if (IsValid(PCGComponent))
 	{
-		PCGComponent->CleanupLocal(/*bRemoveComponents=*/true);
+		PCGComponent->CleanupLocalImmediate(/*bRemoveComponents=*/true);
 	}
 
 	CurrentLOD = ComputeTargetLOD(false);
@@ -1371,95 +1365,6 @@ FVector2D FTerrainGenerator::GetBiomeSite(int32 CellX, int32 CellY) const
 	return FVector2D(SiteX, SiteY);
 }
 
-FVector2D FTerrainGenerator::FindNearestBiomeSite(const FVector2D& Point) const
-{
-	using namespace TerrainChunkPrivate;
-
-	const float BiomeCell = FMath::Max(BiomeCellSize, 1000.0f);
-	const int32 BaseCellX = FMath::FloorToInt(static_cast<float>(Point.X) / BiomeCell);
-	const int32 BaseCellY = FMath::FloorToInt(static_cast<float>(Point.Y) / BiomeCell);
-
-	FVector2D NearestSite = FVector2D::ZeroVector;
-	double NearestDistSquared = TNumericLimits<double>::Max();
-	for (int32 OffsetY = -BiomeScanRadius; OffsetY <= BiomeScanRadius; ++OffsetY)
-	{
-		for (int32 OffsetX = -BiomeScanRadius; OffsetX <= BiomeScanRadius; ++OffsetX)
-		{
-			const FVector2D Site = GetBiomeSite(BaseCellX + OffsetX, BaseCellY + OffsetY);
-			const double DistSquared = FVector2D::DistSquared(Point, Site);
-			if (DistSquared < NearestDistSquared)
-			{
-				NearestDistSquared = DistSquared;
-				NearestSite = Site;
-			}
-		}
-	}
-
-	return NearestSite;
-}
-
-bool FTerrainGenerator::IsInDesertRegion(const FVector2D& Site) const
-{
-	using namespace TerrainChunkPrivate;
-
-	if (DesertRegionChance <= 0.0f)
-	{
-		return false;
-	}
-
-	// Regions are spaced so that even the largest one stays inside its own grid cell: they never overlap, and a
-	// site only needs the 3x3 grid cells around it.
-	const float MaxSize = FMath::Max(DesertRegionMaxSize, 1000.0f);
-	const float MinSize = FMath::Clamp(DesertRegionMinSize, 0.0f, MaxSize);
-	const float Step = MaxSize * DesertRegionSpacingScale;
-	const float CenterJitter = 0.5f * MaxSize / Step;
-	const float BiomeCell = FMath::Max(BiomeCellSize, 1000.0f);
-
-	const int32 BaseCellX = FMath::FloorToInt(static_cast<float>(Site.X) / Step);
-	const int32 BaseCellY = FMath::FloorToInt(static_cast<float>(Site.Y) / Step);
-	for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
-	{
-		for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
-		{
-			const int32 CellX = BaseCellX + OffsetX;
-			const int32 CellY = BaseCellY + OffsetY;
-
-			// The draw order is fixed, so every query sees the same region for a grid cell.
-			const uint32 CellHash = HashCombine(HashCombine(GetTypeHash(CellX), GetTypeHash(CellY)), static_cast<uint32>(InitData.Seed) ^ 0x27D4EB2Fu);
-			FRandomStream Stream(static_cast<int32>(CellHash));
-			const FVector2D Center((static_cast<float>(CellX) + Stream.FRandRange(CenterJitter, 1.0f - CenterJitter)) * Step,
-				(static_cast<float>(CellY) + Stream.FRandRange(CenterJitter, 1.0f - CenterJitter)) * Step);
-			const float Radius = 0.5f * Stream.FRandRange(MinSize, MaxSize);
-			const float Roll = Stream.FRand();
-
-			// Deserts belong to the outer world, like mountains, and stay off the start island.
-			const float CenterX = static_cast<float>(Center.X);
-			const float CenterY = static_cast<float>(Center.Y);
-			const float Remoteness = FMath::Clamp(static_cast<float>(Center.Size()) / FMath::Max(BiomeFalloffRadius, 1.0f), 0.0f, 1.0f);
-			const float Chance = DesertRegionChance * FMath::SmoothStep(0.6f, 1.0f, Remoteness) * (1.0f - ComputeStartIslandBias(CenterX, CenterY));
-			if (Roll >= Chance)
-			{
-				continue;
-			}
-
-			const float Distance = static_cast<float>(FVector2D::Distance(Site, Center));
-			if (Distance <= Radius)
-			{
-				return true;
-			}
-
-			// A region smaller than a cell may catch no site at all, so the cell nearest to its centre always joins.
-			// That site is never farther than MaxNearestSiteDistance cells from the centre.
-			if (Distance <= BiomeCell * MaxNearestSiteDistance && FindNearestBiomeSite(Center) == Site)
-			{
-				return true;
-			}
-		}
-	}
-
-	return false;
-}
-
 FBiomeContext FTerrainGenerator::QueryBiomeSites(float WorldX, float WorldY, TArray<FBiomeSite, TInlineAllocator<8>>* OutBlendSites) const
 {
 	using namespace TerrainChunkPrivate;
@@ -1510,7 +1415,6 @@ FBiomeContext FTerrainGenerator::QueryBiomeSites(float WorldX, float WorldY, TAr
 	Context.PrimaryBiome = DetermineBiomeForCell(Sites[NearestSite]);
 	Context.SecondaryBiome = DetermineBiomeForCell(Sites[SecondSite]);
 	Context.DistanceToEdge = Dist2 - Dist1;
-	Context.EdgeBlendWeight = FMath::SmoothStep(0.0f, BlendWidth, Context.DistanceToEdge);
 
 	if (OutBlendSites)
 	{
@@ -2102,13 +2006,13 @@ bool FTerrainGenerator::MakeLakeCandidate(int32 CellX, int32 CellY, FMountainLak
 	const float Radius = bIsCaldera
 		? Stream.FRandRange(5500.0f, LakeMaxRadius)
 		: Stream.FRandRange(2800.0f, 4200.0f);
-	const bool bCliffShore = Stream.FRand() >= 0.5f;
+	// This draw is unused. It stays so the following draws keep their stream positions.
+	Stream.FRand();
 
 	OutLake = FMountainLakeData();
 	OutLake.Center = FVector2D(CenterX, CenterY);
 	OutLake.Radius = Radius;
 	OutLake.BedDepth = LakeBedDepth;
-	OutLake.bCliffShore = bCliffShore;
 	OutLake.LakeType = (Stream.FRand() >= 0.5f) ? EMountainLakeType::TectonicRift : EMountainLakeType::GlacialCirque;
 	OutLake.AspectRatio = Stream.FRandRange(2.0f, 2.6f);
 	OutLake.CirqueAngle = Stream.FRandRange(0.0f, 2.0f * PI);
@@ -2452,10 +2356,10 @@ float FTerrainGenerator::ComputeHeight(float WorldX, float WorldY, TConstArrayVi
 		TArray<FBiomeSite, TInlineAllocator<8>> BlendSites;
 		Context = QueryBiomeSites(WorldX, WorldY, &BlendSites);
 
-		// Height blend across cell borders. The primary cell has weight 1; every neighbouring cell fades in towards
-		// its border with weight 1 - EdgeBlendWeight measured to that cell. Taking all neighbours rather than only
-		// the second nearest keeps the height continuous where the second and third nearest sites swap, and both
-		// sides of a border get the same average instead of each other's height.
+		// Height blend across cell borders. The primary cell has weight 1; every neighbouring cell fades in
+		// towards its border. Taking all neighbours rather than only the second nearest keeps the height
+		// continuous where the second and third nearest sites swap, and both sides of a border get the same
+		// average instead of each other's height.
 		const float BlendWidth = GetBiomeBlendWidth();
 		const float Dist1 = BlendSites[0].Distance;
 
@@ -2777,10 +2681,26 @@ void FTerrainGenerator::BuildTerrainBuffers(int32 LOD, bool bWithSkirts, FTerrai
 			const float HeightD = SampleNormalHeight(0.0f, -CellSize);
 			const float HeightU = SampleNormalHeight(0.0f, CellSize);
 
+			// Central difference over ±CellSize. GetSafeNormal returns zero for a degenerate vector; the packed
+			// vertex format then stores that zero and directional light drops out, leaving only the skylight.
+			FVector Normal = FVector(HeightL - HeightR, HeightD - HeightU, NormalZ).GetSafeNormal();
+			if (Normal.IsNearlyZero())
+			{
+				Normal = FVector::UpVector;
+			}
+
+			// TangentX must be unit length and perpendicular to the normal. A constant world X is parallel to
+			// steep slopes, and the renderer builds TangentY from the cross product.
+			FVector TangentX = FVector::VectorPlaneProject(FVector::ForwardVector, Normal).GetSafeNormal();
+			if (TangentX.IsNearlyZero())
+			{
+				TangentX = FVector::VectorPlaneProject(FVector::RightVector, Normal).GetSafeNormal();
+			}
+
 			OutBuffers.Vertices.Add(FVector(LocalX, LocalY, HeightAt(X, Y)));
-			OutBuffers.Normals.Add(FVector(HeightL - HeightR, HeightD - HeightU, NormalZ).GetSafeNormal());
+			OutBuffers.Normals.Add(Normal);
 			OutBuffers.UVs.Add(FVector2D(static_cast<float>(X) * InvQuads, static_cast<float>(Y) * InvQuads));
-			OutBuffers.Tangents.Add(FProcMeshTangent(1.0f, 0.0f, 0.0f));
+			OutBuffers.Tangents.Add(FProcMeshTangent(TangentX, false));
 
 			OutBuffers.Colors.Add(BiomeColors[(X + 1) + ((Y + 1) * HeightsPerSide)]);
 		}
@@ -2869,6 +2789,23 @@ void FTerrainGenerator::BuildGrassTransforms(const FTerrainMeshBuffers& Lod0Terr
 				{
 					continue;
 				}
+
+				// World-space Perlin, shifted by the chunk seed so two worlds do not share the same bald patches.
+				if (Rule.GrassNoiseFrequency > 0.0f && Rule.GrassDensityThreshold > 0.0f)
+				{
+					const float WorldX = ChunkOriginX + SampleLocalX;
+					const float WorldY = ChunkOriginY + SampleLocalY;
+					const FVector2D SeedShift(
+						static_cast<float>(InitData.Seed & 0xFFFF),
+						static_cast<float>((InitData.Seed >> 16) & 0xFFFF));
+					const float NoiseVal = FMath::PerlinNoise2D((FVector2D(WorldX, WorldY) + SeedShift) * Rule.GrassNoiseFrequency);
+					const float NormalizedNoise = (NoiseVal + 1.0f) * 0.5f;
+					if (NormalizedNoise < Rule.GrassDensityThreshold)
+					{
+						continue;
+					}
+				}
+
 				if (GrassStream.FRand() > Rule.SpawnChance)
 				{
 					continue;
@@ -2976,6 +2913,8 @@ void ATerrainChunk::GenerateTerrainMesh()
 			Rule.BiomeId = Entry.BiomeId;
 			Rule.SpawnStep = Entry.SpawnStep;
 			Rule.SpawnChance = Entry.SpawnChance;
+			Rule.GrassNoiseFrequency = FMath::Max(Entry.GrassNoiseFrequency, 0.0f);
+			Rule.GrassDensityThreshold = FMath::Clamp(Entry.GrassDensityThreshold, 0.0f, 1.0f);
 			Rule.MinHeight = Entry.MinHeight;
 			Rule.MaxHeight = Entry.MaxHeight;
 			Rule.MinUpDot = Entry.MinUpDot;
@@ -3044,9 +2983,11 @@ void ATerrainChunk::ApplyMesh(const FTerrainBuildRequest& Request, const FTerrai
 
 	const FTerrainMeshBuffers& Terrain = Result.Terrain;
 
+	// Drop every previous section before writing the new surface. CreateMeshSection only replaces its own index.
+	ProceduralMesh->ClearAllMeshSections();
+
 	if (Request.bDedicatedServer)
 	{
-		ProceduralMesh->ClearAllMeshSections();
 		ProceduralMesh->CreateMeshSection(TerrainSectionIndex, Terrain.Vertices, Terrain.Triangles, Terrain.Normals,
 			Terrain.UVs, Terrain.Colors, Terrain.Tangents, true);
 	}
@@ -3081,6 +3022,13 @@ void ATerrainChunk::ApplyMesh(const FTerrainBuildRequest& Request, const FTerrai
 		}
 	}
 
+	// CreateMeshSection updates bounds per section. Refresh once after the whole surface so shadow culling sees the chunk.
+	ProceduralMesh->SetCastShadow(true);
+	ProceduralMesh->bCastDynamicShadow = true;
+	ProceduralMesh->UpdateBounds();
+	ProceduralMesh->MarkRenderStateDirty();
+	ProceduralMesh->MarkRenderTransformDirty();
+
 	bHasGeneratedMesh = true;
 	bCollisionApplied = Request.bTerrainCollision || Request.bCollisionGrid;
 
@@ -3088,13 +3036,7 @@ void ATerrainChunk::ApplyMesh(const FTerrainBuildRequest& Request, const FTerrai
 	if (Request.bBuildGrass && !Request.bDedicatedServer && !IsNetMode(NM_DedicatedServer))
 	{
 		EnsureGrassComponents();
-		for (const TPair<uint8, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>>& HISMPair : BiomeGrassHISMs)
-		{
-			if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = HISMPair.Value.Get())
-			{
-				GrassHISM->ClearInstances();
-			}
-		}
+		ClearAllGrassInstances();
 
 		for (const TPair<uint8, TArray<FTransform>>& Pair : Result.GrassTransforms)
 		{
@@ -3105,6 +3047,11 @@ void ATerrainChunk::ApplyMesh(const FTerrainBuildRequest& Request, const FTerrai
 					if (Pair.Value.Num() <= 0)
 					{
 						continue;
+					}
+
+					if (!GrassHISM->IsRegistered())
+					{
+						GrassHISM->RegisterComponent();
 					}
 
 					GrassHISM->AddInstances(Pair.Value, /*bShouldReturnIndices=*/false);
@@ -3120,6 +3067,17 @@ void ATerrainChunk::ApplyMesh(const FTerrainBuildRequest& Request, const FTerrai
 						}
 						GrassHISM->MarkRenderStateDirty();
 					}
+				}
+			}
+		}
+
+		for (const TPair<uint8, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>>& HISMPair : BiomeGrassHISMs)
+		{
+			if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = HISMPair.Value.Get(); IsValid(GrassHISM))
+			{
+				if (GrassHISM->GetInstanceCount() == 0 && GrassHISM->IsRegistered())
+				{
+					GrassHISM->UnregisterComponent();
 				}
 			}
 		}
@@ -3152,27 +3110,30 @@ void ATerrainChunk::EnsureGrassComponents()
 			{
 				GrassHISM->SetCullDistances(CullStart, CullEnd);
 				GrassHISM->NumCustomDataFloats = 2;
+				continue;
 			}
-			continue;
 		}
 
 		const FName CompName = *FString::Printf(TEXT("GrassHISM_%u"), Entry.BiomeId);
-		UHierarchicalInstancedStaticMeshComponent* GrassHISM = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, CompName);
-		// Root ProceduralMesh is Movable. A Static child cannot attach to it.
-		GrassHISM->SetMobility(EComponentMobility::Stationary);
-		GrassHISM->SetupAttachment(GetRootComponent());
-		GrassHISM->SetStaticMesh(Entry.Mesh);
-		GrassHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-		GrassHISM->SetGenerateOverlapEvents(false);
-		GrassHISM->SetCanEverAffectNavigation(false);
-		GrassHISM->SetCastShadow(false);
-		GrassHISM->bAffectDynamicIndirectLighting = false;
-		GrassHISM->bAffectDistanceFieldLighting = false;
-		GrassHISM->SetReceivesDecals(false);
-		GrassHISM->NumCustomDataFloats = 2;
-		GrassHISM->SetCullDistances(CullStart, CullEnd);
-		GrassHISM->RegisterComponent();
+		UHierarchicalInstancedStaticMeshComponent* GrassHISM = FindObject<UHierarchicalInstancedStaticMeshComponent>(this, *CompName.ToString());
+		if (!GrassHISM)
+		{
+			GrassHISM = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, CompName);
+			// Root ProceduralMesh is Movable. A Static child cannot attach to it.
+			GrassHISM->SetMobility(EComponentMobility::Stationary);
+			GrassHISM->SetupAttachment(GetRootComponent());
+			GrassHISM->SetStaticMesh(Entry.Mesh);
+			GrassHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			GrassHISM->SetGenerateOverlapEvents(false);
+			GrassHISM->SetCanEverAffectNavigation(false);
+			GrassHISM->SetCastShadow(false);
+			GrassHISM->bAffectDynamicIndirectLighting = false;
+			GrassHISM->bAffectDistanceFieldLighting = false;
+			GrassHISM->SetReceivesDecals(false);
+			GrassHISM->NumCustomDataFloats = 2;
+		}
 
+		GrassHISM->SetCullDistances(CullStart, CullEnd);
 		BiomeGrassHISMs.Add(Entry.BiomeId, GrassHISM);
 	}
 }
@@ -3207,7 +3168,8 @@ void ATerrainChunk::GeneratePCG()
 
 	// Local, not networked: every machine builds the same terrain from InitData, so each scatters the same
 	// deterministic result itself instead of the server multicasting it. Once per InitData, since LOD rebuilds
-	// change only the mesh resolution.
+	// change only the mesh resolution. Immediate cleanup drops anything a previous pooled life left behind.
+	PCGComponent->CleanupLocalImmediate(/*bRemoveComponents=*/true);
 	PCGComponent->bActivated = true;
 	PCGComponent->GenerateLocal(/*bForce=*/true);
 	bPCGGenerated = true;

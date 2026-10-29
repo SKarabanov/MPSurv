@@ -150,14 +150,14 @@ protected:
 	int32 DespawnMargin = 2;
 
 	/** Seconds between player position polls. */
-	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0.05", Units = "s",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Streaming", meta = (ClampMin = "0.05", Units = "s",
 		EditCondition = "SpawnMode == ETerrainSpawnMode::DynamicStreaming", EditConditionHides))
-	float StreamingUpdateInterval = 0.25f;
+	float StreamingUpdateInterval = 0.1f;
 
 	/** Spawn budget per streaming update; the nearest chunks to any player go first. */
-	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "1",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Streaming", meta = (ClampMin = "1",
 		EditCondition = "SpawnMode == ETerrainSpawnMode::DynamicStreaming", EditConditionHides))
-	int32 MaxChunksPerUpdate = 4;
+	int32 MaxChunksPerUpdate = 1;
 
 	/**
 	 * Chunks within this distance of any player have physical collision on the server; farther ones have none.

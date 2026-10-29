@@ -50,9 +50,6 @@ struct FBiomeContext
 
 	/** Dist2 - Dist1 to the two nearest sites: 0 on the cell border, growing towards the cell centre. */
 	float DistanceToEdge = 0.0f;
-
-	/** Height blend towards PrimaryBiome: 0 on the cell border, 1 from 0.15 * BiomeCellSize of DistanceToEdge inwards. */
-	float EdgeBlendWeight = 1.0f;
 };
 
 /** A Voronoi biome site near a query point. */
@@ -181,14 +178,6 @@ struct FTerrainGenerationSettings
 	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "1000.0", Units = "cm"))
 	float BiomeCellSize = 60000.0f;
 
-	/** Cells whose site lies within this distance of the world origin are always plains. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
-	float CenterPlainsRadius = 15000.0f;
-
-	/** Distance from the world origin at which plains reach their minimum chance and the other biomes their full chance. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "1.0", Units = "cm"))
-	float BiomeFalloffRadius = 150000.0f;
-
 	/** How far a low-frequency warp shifts a site before distance and latitude are measured, so ring borders stay ragged. */
 	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
 	float BiomeWarpAmplitude = 120000.0f;
@@ -217,7 +206,7 @@ struct FTerrainGenerationSettings
 	float FoothillsMaxHeight = 8000.0f;
 
 	// Per-biome shape. Filled on the game thread from the matching UBiomeDataAsset.
-	// Desert region size and oasis spacing are world layout and come from UWorldGenSettings.
+	// Oasis spacing is world layout and comes from UWorldGenSettings.
 	// These values are the fallback when that asset is missing.
 
 	// --- Ocean ---
@@ -380,18 +369,6 @@ struct FTerrainGenerationSettings
 	/** Level of the desert floor between the dunes above the sea. */
 	float DesertBaseHeight = 500.0f;
 
-	/**
-	 * Smallest desert across. Every biome cell whose site falls in a desert region becomes desert, so a desert is
-	 * at least one cell (BiomeCellSize) even when this is smaller.
-	 */
-	float DesertRegionMinSize = 60000.0f;
-
-	/** Largest desert across. Desert regions are spaced 1.5x this apart, so larger deserts are also sparser. */
-	float DesertRegionMaxSize = 200000.0f;
-
-	/** Chance that a desert region exists in the outer world; it fades out towards the start island. */
-	float DesertRegionChance = 0.6f;
-
 	/** Frequency of fine surface roughness on the dunes. */
 	float DesertDetailFrequency = 0.00025f;
 
@@ -455,9 +432,6 @@ struct FMountainLakeData
 	float WaterZ = 0.0f;
 	float BedDepth = 0.0f;
 
-	/** True for a steep cliff shore, false for a gentle pebble beach. */
-	bool bCliffShore = false;
-
 	EMountainLakeType LakeType = EMountainLakeType::TectonicRift;
 
 	/** Major to minor semi-axis ratio of a rift; Radius is the major semi-axis. */
@@ -491,9 +465,23 @@ struct FBiomeGrassEntry
 	UPROPERTY(EditDefaultsOnly, Category = "Grass", meta = (ClampMin = "10.0", Units = "cm"))
 	float SpawnStep = 50.0f;
 
-	/** Chance to place an instance at a sample that already passes height and slope filters. */
+	/** Chance to place an instance at a sample that already passes height, slope, and the noise patch. */
 	UPROPERTY(EditDefaultsOnly, Category = "Grass", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float SpawnChance = 0.35f;
+
+	/**
+	 * World-space frequency of the grass patch noise, multiplied by position in centimeters.
+	 * 0.005 is one patch about every 2 m. 0 disables the patch test.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Grass", meta = (ClampMin = "0.0"))
+	float GrassNoiseFrequency = 0.005f;
+
+	/**
+	 * Samples whose normalized Perlin value is below this are left bare.
+	 * 0 fills the whole cell, 1 leaves almost no grass.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Grass", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float GrassDensityThreshold = 0.4f;
 
 	/** Lowest surface height that still receives grass, in world units. */
 	UPROPERTY(EditDefaultsOnly, Category = "Grass", meta = (Units = "cm"))
@@ -530,6 +518,8 @@ struct FBiomeGrassSpawnRule
 	uint8 BiomeId = 1;
 	float SpawnStep = 50.0f;
 	float SpawnChance = 0.35f;
+	float GrassNoiseFrequency = 0.005f;
+	float GrassDensityThreshold = 0.4f;
 	float MinHeight = 50.0f;
 	float MaxHeight = 8000.0f;
 	float MinUpDot = 0.8f;
