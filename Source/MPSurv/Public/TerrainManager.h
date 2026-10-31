@@ -15,7 +15,7 @@ class ATerrainChunk;
 UENUM(BlueprintType)
 enum class ETerrainSpawnMode : uint8
 {
-	/** Spawns a fixed square grid of GridRadius around the origin synchronously at startup, without collision. For inspecting terrain in Simulate. */
+	/** Spawns a fixed square grid of GridRadius around the origin, without collision. For inspecting terrain in Simulate. The resident set is capped. */
 	StaticDebugGrid,
 	/** Streams chunks in and out around active players on the server. */
 	DynamicStreaming
@@ -46,21 +46,13 @@ public:
 	/** Game thread. Grass entries from the loaded biome assets. BiomeId is taken from the asset, not the entry. */
 	const TArray<FBiomeGrassEntry>& GetGrassEntries() const;
 
-	/** Radius, in chunks, inside which a pawn keeps physical collision. Shared by the server and by clients. */
+	/** Radius, in chunks, inside which a pawn keeps physical collision. Grass and PCG use the same radius to turn on and one chunk more to turn off. */
 	int32 GetCollisionRadiusInChunks() const { return CollisionRadiusInChunks; }
 
-	/**
-	 * Game thread, every rendering machine. At most MaxVisualLODRebuildsPerFrame visual LOD rebuilds may start on
-	 * one frame, and that many may be in flight. The slot stays taken until the rebuild reaches ApplyMesh, so
-	 * finished workers cannot upload on the same frame. Collision rebuilds and the first mesh of a chunk do not
-	 * call this. Returns false when the caller should retry next tick without changing its LOD.
-	 */
-	bool TryConsumeVisualLODRebuild(ATerrainChunk* Chunk);
+	/** Game thread. One detail refresh (grass and PCG) is pumped per frame. */
+	void EnqueueDetailRefresh(class ATerrainChunk* Chunk);
 
-	/** Drops the visual LOD slot held by Chunk. A second release, or one from a chunk that holds none, is ignored. */
-	void ReleaseVisualLODRebuild(ATerrainChunk* Chunk);
-
-	/** Spawns up to ChunksPerFrame chunks from GenerationQueue; switches itself off once the queue is empty. */
+	/** Spawns up to ChunksPerFrame chunks from GenerationQueue and polls pawn chunk cells. */
 	virtual void Tick(float DeltaTime) override;
 
 protected:
@@ -109,6 +101,12 @@ protected:
 	/** Hides and resets a chunk, then stores it for the next AcquireChunk. */
 	void ReleaseChunk(ATerrainChunk* Chunk);
 
+	/** Compares each pawn's chunk cell with the last poll. A move inside one 64 m cell does nothing. */
+	void PollPlayerChunkCells();
+
+	/** Runs one queued grass/PCG refresh. */
+	void PumpDetailQueue();
+
 	UPROPERTY(EditAnywhere, Category = "Terrain Grid")
 	TSubclassOf<ATerrainChunk> ChunkClass;
 
@@ -130,14 +128,17 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Terrain Grid")
 	int32 WorldSeed = 1337;
 
-	/** Chunks spawned from GenerationQueue per frame. Each one builds its mesh synchronously on spawn. */
+	/** Chunks taken from GenerationQueue per frame. Only the first chunk of a debug-grid session builds on the game thread. */
 	UPROPERTY(EditAnywhere, Category = "Terrain", meta = (ClampMin = "1"))
 	int32 ChunksPerFrame = 1;
 
 	UPROPERTY(EditAnywhere, Category = "Mode")
 	ETerrainSpawnMode SpawnMode = ETerrainSpawnMode::StaticDebugGrid;
 
-	/** Grid half-extent in chunks for StaticDebugGrid. 1 gives 3x3 chunks, 2 gives 5x5. */
+	/**
+	 * Grid half-extent in chunks for StaticDebugGrid. 1 gives 3×3 chunks, 2 gives 5×5.
+	 * The square is (2·R+1)² actors, each a full mesh. Above 1024 chunks only the nearest are spawned.
+	 */
 	UPROPERTY(EditAnywhere, Category = "Debug", meta = (ClampMin = "0",
 		EditCondition = "SpawnMode == ETerrainSpawnMode::StaticDebugGrid", EditConditionHides))
 	int32 GridRadius = 15;
@@ -171,8 +172,8 @@ protected:
 	int32 MaxChunksPerUpdate = 1;
 
 	/**
-	 * Chunks within this distance of any player have physical collision on the server; farther ones have none.
-	 * Visual LOD is not driven by the server: every rendering machine picks it from its own camera.
+	 * Chunks within this distance of any player have physical collision; farther ones have none.
+	 * Visual LOD is the renderer's ScreenSize test, not this radius.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0",
 		EditCondition = "SpawnMode == ETerrainSpawnMode::DynamicStreaming", EditConditionHides))
@@ -185,13 +186,6 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Streaming", meta = (ClampMin = "0",
 		EditCondition = "SpawnMode == ETerrainSpawnMode::DynamicStreaming", EditConditionHides))
 	int32 PreSpawnRadius = 2;
-
-	/**
-	 * Visual LOD rebuilds that may start on one frame, per rendering machine. Each one keeps its slot until the
-	 * mesh is uploaded, so a burst of chunks crossing a LOD distance cannot recreate their proxies together.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD", meta = (ClampMin = "1"))
-	int32 MaxVisualLODRebuildsPerFrame = 1;
 
 private:
 	UPROPERTY(Transient)
@@ -206,14 +200,17 @@ private:
 
 	FTimerHandle StreamingTimerHandle;
 
-	/** Chunks whose visual LOD rebuild has started and not yet reached ApplyMesh. */
-	TArray<TWeakObjectPtr<ATerrainChunk>> VisualLODRebuildOwners;
+	/** Grass and PCG refreshes waiting for a frame budget. One chunk leaves this queue per tick. */
+	TArray<TWeakObjectPtr<ATerrainChunk>> DetailQueue;
 
-	/** GFrameCounter of the frame VisualLODRebuildsThisFrame counts. */
-	uint64 VisualLODBudgetFrame = 0;
+	/** Chunk cells occupied by pawns on the previous poll. Empty until the first pawn is seen. */
+	TArray<FIntPoint> LastPlayerChunkCells;
 
-	/** Visual LOD rebuilds started on VisualLODBudgetFrame. */
-	int32 VisualLODRebuildsThisFrame = 0;
+	/** Chunk cells last seen by UpdateStreaming. The grid scan is skipped while these stay put and the ring is full. */
+	TArray<FIntPoint> LastStreamingCells;
+
+	/** True after a scan found every chunk inside StreamingRadius and none past the despawn margin. */
+	bool bStreamingRingSettled = false;
 
 	/** Hard refs so the loaded assets and their grass meshes are not collected after the synchronous load. */
 	mutable TStrongObjectPtr<UWorldGenSettings> LoadedWorldGenSettings;

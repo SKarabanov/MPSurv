@@ -21,12 +21,12 @@ void RegisterMPSurvTerrainPointAccessors();
 void UnregisterMPSurvTerrainPointAccessors();
 
 /**
- * PCG sampler that reads a dynamic procedural mesh. The stock mesh sampler needs cooked collision;
- * terrain chunks keep their surface in UProceduralMeshComponent sections.
+ * PCG sampler that reads ATerrainChunk::GetCachedLOD0Grid, the 65×65 LOD 0 surface.
+ * The stock mesh sampler needs cooked collision; this node uses the height cache instead.
  *
  * Vertex colors stay the terrain pair packing: R is the lower biome id, G the higher id, B the weight of G.
  * Point Color stores that color in 0-1. The BiomeId attribute is the dominant id (G when B >= 128, otherwise R).
- * Skirt vertices appended after the grid are skipped. $Normal and the point rotation Z are the vertex normal.
+ * $Normal and the point rotation Z are the vertex normal.
  */
 UCLASS(BlueprintType, ClassGroup = (Procedural))
 class MPSURV_API UPCGProceduralMeshSamplerSettings : public UPCGSettings

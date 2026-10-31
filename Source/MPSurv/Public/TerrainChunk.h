@@ -7,9 +7,11 @@
 #include "CoreMinimal.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "GameFramework/Actor.h"
-#include "ProceduralMeshComponent.h"
+#include "RealtimeMeshComponent.h"
+#include "RealtimeMeshSimple.h"
 #include "TerrainChunk.generated.h"
 
+class ATerrainManager;
 class UMaterialInterface;
 class UPCGComponent;
 class UStaticMesh;
@@ -156,7 +158,7 @@ struct FTerrainGenerationSettings
 
 	/**
 	 * Reach of the start island around the world origin. Within it the continentalness is lifted, most strongly
-	 * at the centre, and swamps, plateaus and mountains give way to plains and forests.
+	 * at the centre. The lift does not change which biome the rings and latitude bands pick.
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Start Island", meta = (ClampMin = "1.0", Units = "cm"))
 	float StartIslandRadius = 250000.0f;
@@ -527,29 +529,25 @@ struct FBiomeGrassSpawnRule
 	float ScaleMax = 1.25f;
 };
 
-/** CPU-side geometry of one grid build. Plain value type, so it can be built on a worker and moved to the game thread. */
-struct FTerrainMeshBuffers
+/**
+ * One node of the full-detail surface. A chunk build samples this once on a 67×67 grid
+ * (LOD 0 vertices plus a one-cell border). LOD meshes, collision and grass read the stored node.
+ */
+struct FTerrainGridSample
 {
-	int32 QuadCount = 0;
-	float Step = 0.0f;
+	float Height = 0.0f;
 
-	/** Heights with a one-cell border on every side, HeightsPerSide = QuadCount + 3. Empty for water. */
-	TArray<float> Heights;
-	int32 HeightsPerSide = 0;
+	/** Central difference over ±CellSize, unit length. */
+	FVector Normal = FVector::UpVector;
 
-	TArray<FVector> Vertices;
-	TArray<int32> Triangles;
-	TArray<FVector> Normals;
-	TArray<FVector2D> UVs;
-	TArray<FProcMeshTangent> Tangents;
+	/** Unit tangent perpendicular to Normal. */
+	FVector Tangent = FVector::ForwardVector;
 
-	/**
-	 * Terrain: R is the lower of the two biome IDs, G the higher, B the weight of G (0 = all R, 255 = all G).
-	 * Corners of one triangle share R and G. A corner that would disagree is a copy, so IDs are not interpolated.
-	 * The heavier biome is G when B >= 128 and R otherwise. Sea, flooded shore and oasis stay the heavier biome.
-	 * Water: RGB hold the wave attenuation mask, 0 at the shore and 255 over deep water.
-	 */
-	TArray<FColor> Colors;
+	/** Packed biome pair: R is the lower id, G the higher id, B the weight of G. */
+	FColor VertexColor = FColor::Black;
+
+	/** Strict biome: sea, flooded shore, oasis, foothills, otherwise the nearest cell. */
+	uint8 StrictBiome = 0;
 };
 
 /** What one chunk build should produce, decided on the game thread and copied to the worker. */
@@ -557,26 +555,14 @@ struct FTerrainBuildRequest
 {
 	FTerrainGenerationSettings Settings;
 
-	/** LOD of the terrain grid. Always 0 on a dedicated server. */
-	int32 LOD = 0;
-
-	/** Dedicated server: a single collision-only terrain section, no skirts, no water. */
+	/** Dedicated server: height grid only. Collision is built from that grid later. No skirts, no water, no visual LODs. */
 	bool bDedicatedServer = false;
 
-	/** The terrain section carries collision itself (its grid is LOD 0). Dedicated server only. */
-	bool bTerrainCollision = false;
-
-	/** Build a hidden LOD 0 section for collision. Visual LOD sections never carry collision. */
-	bool bCollisionGrid = false;
-
 	/**
-	 * Rendering machines: build LOD 0, 1 and 2, each with its own water section, in this one build.
-	 * Later LOD changes only toggle section visibility.
+	 * Rendering machines: one stream set per visual LOD for terrain (with skirts) and one for water.
+	 * The renderer selects the LOD from ScreenSize. This build does not run again when the camera moves.
 	 */
 	bool bBuildAllVisualLODs = false;
-
-	/** Visual sections are already uploaded. This build only creates or clears the hidden collision section. */
-	bool bUpdateCollisionOnly = false;
 
 	/**
 	 * Grass placement rules for the worker. Empty on a dedicated server or when the actor has no grass entries.
@@ -584,26 +570,21 @@ struct FTerrainBuildRequest
 	 */
 	TArray<FBiomeGrassSpawnRule> GrassRules;
 
-	/** When true, the worker runs the independent grass grid pass (not tied to terrain LOD vertices). */
+	/**
+	 * When true, the worker places grass from the 65×65 grid during this build.
+	 * Set on the first client build, including a coarse shown LOD, so a later approach does not rebuild.
+	 */
 	bool bBuildGrass = false;
 };
 
-/** Geometry produced by one chunk build. */
+/** Geometry produced by one chunk build. Stream sets are filled on the worker and moved to the game thread. */
 struct FTerrainBuildResult
 {
-	FTerrainMeshBuffers Terrain;
+	/** Terrain with skirts, one entry per visual LOD. Empty on a dedicated server. */
+	TArray<RealtimeMesh::FRealtimeMeshStreamSet> TerrainLODs;
 
-	/** One entry per visual LOD when the request built every LOD. Empty for a dedicated server and for partial updates. */
-	TArray<FTerrainMeshBuffers> TerrainLODs;
-
-	/** Empty unless the request asked for a collision grid. */
-	FTerrainMeshBuffers Collision;
-
-	/** Empty on a dedicated server or where no water reaches the chunk. */
-	FTerrainMeshBuffers Water;
-
-	/** One water mesh per visual LOD, parallel to TerrainLODs. An entry with no triangles is a dry LOD. */
-	TArray<FTerrainMeshBuffers> WaterLODs;
+	/** Water for the same LOD. An entry with no position stream is a dry LOD. */
+	TArray<RealtimeMesh::FRealtimeMeshStreamSet> WaterLODs;
 
 	/**
 	 * Grass instance transforms in actor-local space, keyed by biome ID.
@@ -616,6 +597,12 @@ struct FTerrainBuildResult
 	 * Float 1 (flatten/interaction) is written as 0 on the game thread until terraforming exists.
 	 */
 	TMap<uint8, TArray<float>> GrassWindPhases;
+
+	/**
+	 * Inner 65×65 LOD 0 nodes, row-major, without the one-cell border.
+	 * Moved onto the chunk on the game thread in ApplyMesh.
+	 */
+	TArray<FTerrainGridSample> CachedLOD0Grid;
 };
 
 /**
@@ -627,9 +614,9 @@ struct FTerrainBuildResult
  * Heights and geometry are computed on a worker thread by CalculateTerrainData and applied on the game thread;
  * start chunks can force their first build to run synchronously (FChunkInitData::bForceSynchronous).
  *
- * Rendering machines pick the visual LOD from the local camera. Collision is controlled by the server
- * (SetCollisionEnabled) on the authority. A client enables it only while the local pawn is within
- * CollisionRadiusInChunks of the chunk square, the same test the server uses.
+ * Visual LOD is selected by the renderer from ScreenSize. Collision is complex mesh data from the 65×65 grid,
+ * cooked once and then toggled. Grass follows the same 2-chunk radius: the server via SetCollisionEnabled,
+ * a client via the local pawn distance.
  */
 UCLASS()
 class MPSURV_API ATerrainChunk : public AActor
@@ -654,22 +641,8 @@ public:
 	static_assert(static_cast<float>(QuadsPerSide) * CellSize == ChunkWorldSize, "CellSize must divide ChunkWorldSize evenly.");
 	static_assert(QuadsPerSide % (1 << (NumLODs - 1)) == 0, "QuadsPerSide must stay divisible by every LOD reduction.");
 
-	/** Hidden LOD 0 collision. PCG prefers this section while it has vertices. */
-	static constexpr int32 CollisionSectionIndex = 2;
-
-	/** Visual terrain. LOD 0 stays in section 0; LOD 1 and 2 sit past the collision section. */
-	static int32 TerrainSectionIndexForLOD(int32 LOD)
-	{
-		const int32 ClampedLOD = FMath::Clamp(LOD, 0, NumLODs - 1);
-		return ClampedLOD == 0 ? 0 : ClampedLOD + 2;
-	}
-
-	/** Water for the same LOD. LOD 0 stays in section 1. */
-	static int32 WaterSectionIndexForLOD(int32 LOD)
-	{
-		const int32 ClampedLOD = FMath::Clamp(LOD, 0, NumLODs - 1);
-		return ClampedLOD == 0 ? 1 : ClampedLOD + 4;
-	}
+	/** Inner 65×65 LOD 0 nodes from the last build. PCG samples this surface. */
+	const TArray<FTerrainGridSample>& GetCachedLOD0Grid() const { return CachedLOD0Grid; }
 
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
@@ -701,20 +674,39 @@ public:
 	static FTerrainBuildResult CalculateTerrainData(FChunkInitData InInitData, float InCellSize, int32 InQuadsPerSide, const FTerrainBuildRequest& Request);
 
 	/**
-	 * Rebuilds the mesh for the current collision state. The first client build uploads every visual LOD and
-	 * its water; later LOD changes only toggle section visibility. A dedicated server only builds collision
-	 * geometry, and only while collision is enabled. The heavy work runs on a worker unless this is the first
-	 * build of a chunk with bForceSynchronous. A request made while a build is running is replayed once that
-	 * build is applied. Skipped while InitData.Seed is 0.
+	 * Builds the chunk once. A rendering machine uploads every visual LOD and its water.
+	 * A dedicated server builds the height grid only, and only when collision is first enabled.
+	 * Later radius changes toggle collision and grass and do not call this again.
+	 * The heavy work runs on a worker unless this is the first build of a chunk with bForceSynchronous.
+	 * A request made while a build is running is replayed once that build is applied.
+	 * Skipped while InitData.Seed is 0.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Terrain")
 	void GenerateTerrainMesh();
 
-	/** Server-only. Enables or disables physical collision of this chunk; rebuilds the mesh on change. */
+	/** Server-only. Enables or disables physical collision. Does not rebuild the visual mesh or drop a cooked body. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Terrain")
 	void SetCollisionEnabled(bool bEnabled);
 
-	/** HISM components created from the loaded biome assets, keyed by biome ID. Valid after EnsureGrassComponents. */
+	/**
+	 * Game thread. Turns the cooked body on or off from the collision radius.
+	 * Leaving the radius keeps the body. ResetChunkState is what drops it.
+	 */
+	void RefreshCollisionState();
+
+	/** True when grass or PCG should be created or released. A dedicated server is always false. */
+	bool NeedsDetailRefresh() const;
+
+	/** Game thread. Applies or releases grass and PCG using a one-chunk hysteresis past the collision radius. */
+	void RefreshDetailState();
+
+	/** Collision, then grass and PCG. The manager calls this for at most one chunk per frame. */
+	void UpdateLocalProximity();
+
+	/** The manager that spawned this chunk. Kept across pool reuse. */
+	void SetTerrainManager(ATerrainManager* InManager);
+
+	/** HISM components for biomes that actually spawned instances. Empty rules never create one. */
 	const TMap<uint8, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>>& GetBiomeGrassHISMs() const { return BiomeGrassHISMs; }
 
 	/**
@@ -725,7 +717,7 @@ public:
 	 *    to collect instance indices that intersect the brush.
 	 * 2. Pass those indices to RemoveInstances on the same HISM (or ClearInstances in the overlapping region via
 	 *    a rebuild of the chunk's grass for that area once streaming edits exist).
-	 * 3. Do not touch ProceduralMesh here; terrain height edits are a separate path that should then regenerate
+	 * 3. Do not touch the realtime mesh here; terrain height edits are a separate path that should then regenerate
 	 *    or patch grass for the affected cells.
 	 *
 	 * Currently a no-op so call sites can be wired before the edit system exists.
@@ -737,44 +729,68 @@ public:
 	FChunkInitData InitData;
 
 protected:
+	virtual void OnConstruction(const FTransform& Transform) override;
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void PostRegisterAllComponents() override;
+
+	/** The Blueprint component template stores a null mesh and overwrites the pointer set in the constructor. */
+	void AttachRealtimeMesh();
 
 	UFUNCTION()
 	void OnRep_InitData();
 
-	/** LOD timer callback on rendering machines: shows the section for the camera distance. */
-	void UpdateVisualLOD();
-
-	/** Shows one terrain LOD and its water section. Does not recreate the scene proxy. */
-	void ApplyVisualLODVisibility(int32 LOD);
-
 	/** Stationary after the mesh upload, so a resting chunk leaves the dynamic visibility path. */
 	void SettleChunkMobility();
 
-	/** Creates or clears the hidden collision section. Create and clear recreate the scene proxy. */
-	void ApplyCollisionSection(const FTerrainMeshBuffers& Collision, bool bEnable);
-
-	/** Fills grass HISMs from a finished build. Does not touch mesh sections. */
-	void ApplyGrassInstances(const FTerrainBuildResult& Result);
-
-	/** Copies grass rules when the shown LOD is 0 and this InitData has not built grass yet. */
-	void PopulateGrassRequest(FTerrainBuildRequest& Request) const;
-
-	/** One next-tick retry while the manager's visual LOD budget is full. Further requests on the same frame are dropped. */
-	void DeferVisualLODRetry();
-
-	/** Returns the visual LOD budget slot held by this chunk, if any. */
-	void ReleaseVisualLODSlot();
+	/** LOD 0 at screen size 1, LOD 1 at LOD1ScreenSize, LOD 2 at LOD2ScreenSize. */
+	void ConfigureVisualLODs();
 
 	/**
-	 * LOD for the current local camera distance, or CurrentLOD if there is no camera yet.
-	 * With hysteresis, a coarser LOD is only chosen once the camera is LODHysteresis past its distance.
+	 * Pushes the mesh bounds into the scene and recreates the static draw list.
+	 * A chunk built before its component is registered has to do this again once it is.
 	 */
-	int32 ComputeTargetLOD(bool bApplyHysteresis) const;
+	/** Pushes RelativeLocation into the world transform and rebuilds the primitive bounds. */
+	void RefreshRenderedMesh();
+
+	/** Local box of the 65×65 grid, extended by the skirt, so culling does not use the empty-mesh sphere. */
+	void ApplyChunkBounds(float SkirtDepth);
+
+	/** One static section group. Skips a stream set that has no positions. */
+	void UploadSectionGroup(int32 LODIndex, FName GroupName, RealtimeMesh::FRealtimeMeshStreamSet&& Streams, int32 MaterialSlot, bool bCastShadow);
+
+	/** Material slots 0 (terrain) and 1 (water). */
+	void SetupMeshMaterials();
+
+	/** Cooks a 2 m complex mesh once, then toggles it. A cooked body survives leaving the radius. */
+	void ApplyStoredCollision(bool bEnable);
+
+	/** Collision off, body kept. */
+	void DisableStoredCollision();
+
+	/** Marks the mesh BodySetup as garbage so a chunk outside the radius does not keep a physics object. */
+	void DestroyMeshBodySetup();
+
+	/** Fills grass HISMs from the cached transforms. Skips a rule that produced no instances. */
+	void ApplyGrassInstances();
+
+	/** Clears and unregisters grass HISMs. The components and the transform cache stay for the next entry. */
+	void ReleaseGrassInstances();
+
+	/** Squared distance in chunks from the local pawn to this chunk. Large when no pawn exists. */
+	float DistSqFromLocalPawn() const;
+
+	/** Grass and PCG: on at CollisionRadiusInChunks, off one chunk farther, so a cell border does not rebuild them. */
+	bool WantsDetail(bool bCurrentlyActive) const;
+
+	/** Copies grass rules on the first client build. Later builds leave grass on the chunk cache. */
+	void PopulateGrassRequest(FTerrainBuildRequest& Request) const;
 
 	/** Authority: the server-controlled flag. Clients: pawn within CollisionRadiusInChunks of this chunk. */
 	bool ShouldHaveCollision() const;
+
+	/** Cached manager. A client fills it from the actor owner the first time the cache is empty. */
+	ATerrainManager* GetTerrainManager() const;
 
 	/**
 	 * Game thread. Numeric snapshot from ATerrainManager. Safe to copy onto a worker; the assets stay on the game thread.
@@ -782,10 +798,10 @@ protected:
 	FTerrainGenerationSettings ResolveGenerationSettings() const;
 
 	/** Game thread. Uploads a finished build into the mesh sections, then starts PCG once per InitData. */
-	void ApplyMesh(const FTerrainBuildRequest& Request, const FTerrainBuildResult& Result);
+	void ApplyMesh(const FTerrainBuildRequest& Request, FTerrainBuildResult& Result);
 
-	/** Game thread. Creates one NoCollision HISM per resolved grass entry that has a mesh. Idempotent. */
-	void EnsureGrassComponents();
+	/** Game thread. Creates one NoCollision HISM for a biome that already has instances. */
+	UHierarchicalInstancedStaticMeshComponent* EnsureGrassComponent(uint8 BiomeId);
 
 	/** Game thread. Clears every grass HISM; used when InitData changes. */
 	void ClearAllGrassInstances();
@@ -794,7 +810,10 @@ protected:
 	void PlaceAtChunkCoords();
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain")
-	TObjectPtr<UProceduralMeshComponent> ProceduralMesh;
+	TObjectPtr<URealtimeMeshComponent> RealtimeMeshComponent;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain")
+	TObjectPtr<URealtimeMeshSimple> RealtimeMesh;
 
 	/** One HISM per biome ID. Built on the game thread; filled from worker transforms in ApplyMesh. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Grass")
@@ -810,28 +829,26 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Terrain")
 	TObjectPtr<UMaterialInterface> WaterMaterial;
 
-	/** Horizontal camera distance to the nearest point of the chunk square beyond which LOD 1 is used (3 chunks). */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|LOD", meta = (ClampMin = "0.0", Units = "cm"))
-	float LOD1Distance = 19200.0f;
+	/** Screen size at which the renderer drops from LOD 0 to LOD 1. LOD 0 stays at 1. */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|LOD", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float LOD1ScreenSize = 0.45f;
 
-	/** Horizontal camera distance to the nearest point of the chunk square beyond which LOD 2 is used (6 chunks). */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|LOD", meta = (ClampMin = "0.0", Units = "cm"))
-	float LOD2Distance = 38400.0f;
-
-	/** Extra distance past a LOD threshold before switching to the coarser LOD, so the mesh does not rebuild back and forth. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|LOD", meta = (ClampMin = "0.0", Units = "cm"))
-	float LODHysteresis = 1000.0f;
-
-	/** Seconds between camera distance checks on rendering machines. */
-	UPROPERTY(EditDefaultsOnly, Category = "Terrain|LOD", meta = (ClampMin = "0.05", Units = "s"))
-	float LODUpdateInterval = 0.5f;
+	/**
+	 * Screen size of the coarsest LOD. Below this the chunk is not drawn.
+	 * 0.06 drops chunks that are only a few pixels, which is the far side of the despawn margin.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Terrain|LOD", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float LOD2ScreenSize = 0.06f;
 
 private:
 	/** Game thread. Applies a finished build unless InitData changed meanwhile, then replays a pending request. */
-	void OnBuildComplete(const FTerrainBuildRequest& Request, const FTerrainBuildResult& Result, uint32 Serial);
+	void OnBuildComplete(const FTerrainBuildRequest& Request, FTerrainBuildResult& Result, uint32 Serial);
 
-	/** Runs PCG once per InitData, after the chunk first has mesh sections. */
+	/** Runs the chunk PCG graph once per visit to the collision radius. The streaming edge does not enqueue it. */
 	void GeneratePCG();
+
+	/** Drops a graph started for this cell so a pooled or distant chunk does not keep its instances. */
+	void ReleasePCG();
 
 	/** True from the start of a build until its result has been handled on the game thread. */
 	std::atomic<bool> bIsGenerating{false};
@@ -845,32 +862,47 @@ private:
 	/** Prevents BeginPlay from rebuilding a mesh already produced by OnRep_InitData. */
 	bool bHasGeneratedMesh = false;
 
-	/** Client mesh already holds every visual LOD. Further LOD changes only toggle visibility. */
+	/** Client mesh already holds every visual LOD for UploadedVisualSeed/Coords. A new InitData builds again. */
 	bool bVisualLODsReady = false;
+
+	/** InitData the current visual sections were built for. Collision toggles do not change it. */
+	uint32 UploadedVisualSeed = 0;
+
+	FIntPoint UploadedVisualCoords = FIntPoint(MIN_int32, MIN_int32);
+
+	/**
+	 * Bumped on every collision cook or discard. A callback with an older serial does not touch the body,
+	 * so a leave/enter pair cannot publish over a newer cook or wipe a mesh that is still in range.
+	 */
+	uint32 CollisionUpdateSerial = 0;
 
 	/** PCG runs once per InitData, not on every LOD rebuild. */
 	bool bPCGGenerated = false;
 
 	/**
-	 * Grass HISMs were filled once for the current InitData. Cleared only on InitData change.
-	 * Survives LOD 0→1→0 so the worker does not rebuild grass when the player returns.
+	 * Grass HISMs are filled while the pawn is inside the collision radius.
+	 * Leaving that radius clears them. The transform cache is what gets reapplied.
 	 */
 	bool bGrassBuilt = false;
 
-	/** Visual LOD of the current mesh. Always 0 on a dedicated server. */
-	int32 CurrentLOD = 0;
+	/**
+	 * First client build stored grass transforms. Entering the collision radius applies this cache on the game thread.
+	 */
+	bool bGrassCacheReady = false;
 
-	/** This chunk has taken a visual LOD budget slot that ReleaseVisualLODSlot has not yet returned. */
-	bool bHoldsVisualLODSlot = false;
+	/** Inner 65×65 LOD 0 nodes from the last build of this InitData. Game thread only. */
+	TArray<FTerrainGridSample> CachedLOD0Grid;
 
-	/** GFrameCounter of the last deferred visual LOD retry. Stops the same frame from queueing more than one. */
-	uint64 VisualLODRetryFrame = 0;
+	/** Grass instance transforms from the first client build, keyed by biome ID. */
+	TMap<uint8, TArray<FTransform>> CachedGrassTransforms;
 
-	bool bVisualLODRetryScheduled = false;
+	/** Wind phase parallel to CachedGrassTransforms. */
+	TMap<uint8, TArray<float>> CachedGrassWindPhases;
 
-	FTimerHandle VisualLODRetryHandle;
+	/** A complex body has been cooked for this cell. Leaving the radius does not clear it. */
+	bool bCollisionCooked = false;
 
-	/** Collision flag last uploaded by ApplyMesh. Clients compare it when the pawn crosses CollisionRadiusInChunks. */
+	/** Collision is enabled on the component. Clients compare it when the pawn crosses CollisionRadiusInChunks. */
 	bool bCollisionApplied = false;
 
 	/**
@@ -882,5 +914,6 @@ private:
 	/** Server-controlled collision state. On by default so the static grid and pre-spawned chunks collide. */
 	bool bServerCollisionEnabled = true;
 
-	FTimerHandle LODTimerHandle;
+	/** Spawned chunks keep the manager here instead of scanning the world on each query. */
+	mutable TWeakObjectPtr<ATerrainManager> CachedTerrainManager;
 };

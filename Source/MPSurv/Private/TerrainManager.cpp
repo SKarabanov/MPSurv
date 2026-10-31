@@ -2,15 +2,24 @@
 
 #include "TerrainManager.h"
 
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Containers/Ticker.h"
 #include "CoreGlobals.h"
 #include "DrawDebugHelpers.h"
+#include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerStart.h"
+#include "PhysicsEngine/BodySetup.h"
+#include "RHIGlobals.h"
+#include "RealtimeMesh.h"
+#include "RealtimeMeshSimple.h"
 #include "TerrainChunk.h"
 #include "TimerManager.h"
+#include "UObject/UObjectArray.h"
+#include "UObject/UObjectIterator.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogTerrainManager, Log, All);
 
@@ -18,6 +27,12 @@ namespace TerrainManagerPrivate
 {
 	/** World-space step of the chunk grid. */
 	constexpr float ChunkWorldSize = ATerrainChunk::ChunkWorldSize;
+
+	/**
+	 * Resident cap for the debug square. Radius 60 is 121×121 = 14641 full meshes and exhausts memory
+	 * around 11000. The queue is nearest-first, so the cap keeps the centre and drops the rest.
+	 */
+	constexpr int32 MaxDebugGridChunks = 1024;
 
 	FVector2D WorldToChunkSpace(const FVector& WorldLocation)
 	{
@@ -46,14 +61,166 @@ namespace TerrainManagerPrivate
 
 ATerrainManager::ATerrainManager()
 {
-	// Ticks only while GenerationQueue has work.
+	// Ticks to watch the pawn's chunk cell and to drain the debug-grid queue.
 	PrimaryActorTick.bCanEverTick = true;
-	PrimaryActorTick.bStartWithTickEnabled = false;
+	PrimaryActorTick.bStartWithTickEnabled = true;
 
 	bReplicates = true;
 	SetReplicateMovement(false);
 
 	ChunkClass = ATerrainChunk::StaticClass();
+}
+
+namespace
+{
+	bool TickTerrainResidentDiagnostics(float /*DeltaTime*/)
+	{
+		int32 ChunksLive = 0;
+		int32 ChunksShown = 0;
+		int32 ChunksHidden = 0;
+		int32 ChunksGarbage = 0;
+		for (TObjectIterator<ATerrainChunk> It; It; ++It)
+		{
+			if (It->IsTemplate())
+			{
+				continue;
+			}
+			if (!IsValid(*It))
+			{
+				++ChunksGarbage;
+				continue;
+			}
+			++ChunksLive;
+			if (It->IsHidden())
+			{
+				++ChunksHidden;
+			}
+			else
+			{
+				++ChunksShown;
+			}
+		}
+
+		int32 Meshes = 0;
+		int32 MeshesGarbage = 0;
+		for (TObjectIterator<URealtimeMesh> It; It; ++It)
+		{
+			if (It->IsTemplate())
+			{
+				continue;
+			}
+			if (!IsValid(*It))
+			{
+				++MeshesGarbage;
+				continue;
+			}
+			++Meshes;
+		}
+
+		int32 MeshComponents = 0;
+		for (TObjectIterator<URealtimeMeshComponent> It; It; ++It)
+		{
+			if (!It->IsTemplate() && IsValid(*It))
+			{
+				++MeshComponents;
+			}
+		}
+
+		int32 Bodies = 0;
+		for (TObjectIterator<UBodySetup> It; It; ++It)
+		{
+			if (!It->IsTemplate() && IsValid(*It) && It->GetOuter() && It->GetOuter()->IsA<URealtimeMesh>())
+			{
+				++Bodies;
+			}
+		}
+
+		int32 GrassComponents = 0;
+		int32 GrassInstances = 0;
+		for (TObjectIterator<UHierarchicalInstancedStaticMeshComponent> It; It; ++It)
+		{
+			if (It->IsTemplate() || !IsValid(*It))
+			{
+				continue;
+			}
+			const AActor* Owner = It->GetOwner();
+			if (!Owner || !Owner->IsA<ATerrainChunk>())
+			{
+				continue;
+			}
+			++GrassComponents;
+			GrassInstances += It->GetInstanceCount();
+		}
+
+		int32 Worlds = 0;
+		int32 PieWorlds = 0;
+		if (GEngine)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				const UWorld* World = Context.World();
+				if (!World)
+				{
+					continue;
+				}
+				++Worlds;
+				if (World->WorldType == EWorldType::PIE)
+				{
+					++PieWorlds;
+				}
+			}
+		}
+
+		const int32 Objects = GUObjectArray.GetObjectArrayNum();
+		const uint64 MemMB = FPlatformMemory::GetStats().UsedPhysical / (1024ull * 1024ull);
+		const uint64 BufMB = GRHIGlobals.BufferMemorySize / (1024ull * 1024ull);
+		const uint64 TexMB = (static_cast<uint64>(GRHIGlobals.StreamingTextureMemorySizeInKB) + static_cast<uint64>(GRHIGlobals.NonStreamingTextureMemorySizeInKB)) / 1024ull;
+
+		static int32 PrevObjects = Objects;
+		static int32 PrevChunks = ChunksLive;
+		static int32 PrevMeshes = Meshes;
+		static int32 PrevGrass = GrassInstances;
+		static uint64 PrevBuf = BufMB;
+
+		UE_LOG(LogTerrainManager, Warning,
+			TEXT("TerrainDiag objects=%d (d=%d) chunks=%d shown=%d hidden=%d garbage=%d (d=%d) meshes=%d garbage=%d (d=%d) comps=%d bodies=%d grass=%d instances=%d (d=%d) worlds=%d pie=%d memMB=%llu bufMB=%llu (d=%lld) texMB=%llu"),
+			Objects, Objects - PrevObjects,
+			ChunksLive, ChunksShown, ChunksHidden, ChunksGarbage, ChunksLive - PrevChunks,
+			Meshes, MeshesGarbage, Meshes - PrevMeshes,
+			MeshComponents, Bodies,
+			GrassComponents, GrassInstances, GrassInstances - PrevGrass,
+			Worlds, PieWorlds,
+			MemMB, BufMB, static_cast<int64>(BufMB) - static_cast<int64>(PrevBuf), TexMB);
+
+		PrevObjects = Objects;
+		PrevChunks = ChunksLive;
+		PrevMeshes = Meshes;
+		PrevGrass = GrassInstances;
+		PrevBuf = BufMB;
+		return true;
+	}
+}
+
+static FTSTicker::FDelegateHandle GTerrainDiagHandle;
+
+void StartTerrainResidentDiagnostics()
+{
+	if (GTerrainDiagHandle.IsValid())
+	{
+		return;
+	}
+
+	GTerrainDiagHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateStatic(&TickTerrainResidentDiagnostics), 2.0f);
+}
+
+void StopTerrainResidentDiagnostics()
+{
+	if (GTerrainDiagHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(GTerrainDiagHandle);
+		GTerrainDiagHandle.Reset();
+	}
 }
 
 void ATerrainManager::BeginPlay()
@@ -63,6 +230,7 @@ void ATerrainManager::BeginPlay()
 	// Clients rebuild meshes from replicated InitData and need the same numbers. The chunk also loads on first use,
 	// so an OnRep that arrives before this still sees the assets.
 	EnsureGenerationAssetsLoaded();
+	SetActorTickEnabled(true);
 
 	if (!HasAuthority())
 	{
@@ -91,56 +259,6 @@ const TArray<FBiomeGrassEntry>& ATerrainManager::GetGrassEntries() const
 {
 	EnsureGenerationAssetsLoaded();
 	return ResolvedGrass;
-}
-
-bool ATerrainManager::TryConsumeVisualLODRebuild(ATerrainChunk* Chunk)
-{
-	if (!IsValid(Chunk))
-	{
-		return false;
-	}
-
-	VisualLODRebuildOwners.RemoveAll([](const TWeakObjectPtr<ATerrainChunk>& HeldChunk)
-	{
-		return !HeldChunk.IsValid();
-	});
-
-	for (const TWeakObjectPtr<ATerrainChunk>& HeldChunk : VisualLODRebuildOwners)
-	{
-		if (HeldChunk.Get() == Chunk)
-		{
-			return false;
-		}
-	}
-
-	const int32 Budget = FMath::Max(MaxVisualLODRebuildsPerFrame, 1);
-	if (VisualLODRebuildOwners.Num() >= Budget)
-	{
-		return false;
-	}
-
-	if (VisualLODBudgetFrame != GFrameCounter)
-	{
-		VisualLODBudgetFrame = GFrameCounter;
-		VisualLODRebuildsThisFrame = 0;
-	}
-
-	if (VisualLODRebuildsThisFrame >= Budget)
-	{
-		return false;
-	}
-
-	++VisualLODRebuildsThisFrame;
-	VisualLODRebuildOwners.Add(Chunk);
-	return true;
-}
-
-void ATerrainManager::ReleaseVisualLODRebuild(ATerrainChunk* Chunk)
-{
-	VisualLODRebuildOwners.RemoveAll([Chunk](const TWeakObjectPtr<ATerrainChunk>& HeldChunk)
-	{
-		return !HeldChunk.IsValid() || HeldChunk.Get() == Chunk;
-	});
 }
 
 void ATerrainManager::EnsureGenerationAssetsLoaded() const
@@ -229,6 +347,9 @@ void ATerrainManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		}
 	}
 
+	UE_LOG(LogTerrainManager, Warning, TEXT("%s EndPlay active=%d pooled=%d queue=%d reason=%d"),
+		*GetName(), ActiveChunks.Num(), FreeChunksPool.Num(), GenerationQueue.Num(), static_cast<int32>(EndPlayReason));
+
 	ActiveChunks.Reset();
 	FreeChunksPool.Reset();
 	GenerationQueue.Reset();
@@ -236,13 +357,128 @@ void ATerrainManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Super::EndPlay(EndPlayReason);
 }
 
+void ATerrainManager::EnqueueDetailRefresh(ATerrainChunk* Chunk)
+{
+	if (!IsValid(Chunk))
+	{
+		return;
+	}
+
+	for (const TWeakObjectPtr<ATerrainChunk>& Pending : DetailQueue)
+	{
+		if (Pending.Get() == Chunk)
+		{
+			return;
+		}
+	}
+
+	DetailQueue.Add(Chunk);
+}
+
+void ATerrainManager::PollPlayerChunkCells()
+{
+	TArray<FVector> PlayerLocations;
+	GatherPlayerLocations(PlayerLocations);
+
+	TArray<FIntPoint> Cells;
+	Cells.Reserve(PlayerLocations.Num());
+	for (const FVector& Location : PlayerLocations)
+	{
+		Cells.Add(FIntPoint(
+			FMath::FloorToInt(Location.X / ATerrainChunk::ChunkWorldSize),
+			FMath::FloorToInt(Location.Y / ATerrainChunk::ChunkWorldSize)));
+	}
+	Cells.Sort([](const FIntPoint& A, const FIntPoint& B)
+	{
+		return A.X < B.X || (A.X == B.X && A.Y < B.Y);
+	});
+
+	if (Cells == LastPlayerChunkCells)
+	{
+		return;
+	}
+	LastPlayerChunkCells = Cells;
+
+	const float CollisionRadiusSq = FMath::Square(static_cast<float>(FMath::Max(CollisionRadiusInChunks, 0)));
+	TArray<FVector2D, TInlineAllocator<8>> PlayerPoints;
+	PlayerPoints.Reserve(PlayerLocations.Num());
+	for (const FVector& Location : PlayerLocations)
+	{
+		PlayerPoints.Add(FVector2D(Location.X / ATerrainChunk::ChunkWorldSize, Location.Y / ATerrainChunk::ChunkWorldSize));
+	}
+
+	auto Visit = [this, &PlayerPoints, CollisionRadiusSq](ATerrainChunk* Chunk)
+	{
+		if (!IsValid(Chunk) || Chunk->IsHidden() || Chunk->InitData.Seed == 0)
+		{
+			return;
+		}
+
+		if (HasAuthority())
+		{
+			float Best = TNumericLimits<float>::Max();
+			for (const FVector2D& Point : PlayerPoints)
+			{
+				const float ChunkX = static_cast<float>(Chunk->InitData.Coords.X);
+				const float ChunkY = static_cast<float>(Chunk->InitData.Coords.Y);
+				const float DX = FMath::Max3(ChunkX - static_cast<float>(Point.X), 0.0f, static_cast<float>(Point.X) - (ChunkX + 1.0f));
+				const float DY = FMath::Max3(ChunkY - static_cast<float>(Point.Y), 0.0f, static_cast<float>(Point.Y) - (ChunkY + 1.0f));
+				Best = FMath::Min(Best, DX * DX + DY * DY);
+			}
+			Chunk->SetCollisionEnabled(Best <= CollisionRadiusSq);
+		}
+		else
+		{
+			Chunk->RefreshCollisionState();
+		}
+
+		if (Chunk->NeedsDetailRefresh())
+		{
+			EnqueueDetailRefresh(Chunk);
+		}
+	};
+
+	if (HasAuthority())
+	{
+		for (const TPair<FIntPoint, TObjectPtr<ATerrainChunk>>& Pair : ActiveChunks)
+		{
+			Visit(Pair.Value);
+		}
+	}
+	else if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<ATerrainChunk> It(World); It; ++It)
+		{
+			Visit(*It);
+		}
+	}
+}
+
+void ATerrainManager::PumpDetailQueue()
+{
+	while (DetailQueue.Num() > 0)
+	{
+		ATerrainChunk* Chunk = DetailQueue[0].Get();
+		DetailQueue.RemoveAt(0, 1, EAllowShrinking::No);
+		if (!IsValid(Chunk))
+		{
+			continue;
+		}
+
+		Chunk->UpdateLocalProximity();
+		return;
+	}
+}
+
 void ATerrainManager::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	PollPlayerChunkCells();
+	PumpDetailQueue();
+
 	if (GenerationQueue.IsEmpty())
 	{
-		SetActorTickEnabled(false);
 		return;
 	}
 
@@ -264,7 +500,6 @@ void ATerrainManager::Tick(float DeltaTime)
 	if (GenerationQueue.IsEmpty())
 	{
 		GenerationQueue.Empty();
-		SetActorTickEnabled(false);
 	}
 }
 
@@ -321,6 +556,15 @@ void ATerrainManager::SpawnInitialGrid()
 	{
 		return A.SizeSquared() > B.SizeSquared();
 	});
+
+	if (GenerationQueue.Num() > TerrainManagerPrivate::MaxDebugGridChunks)
+	{
+		const int32 Requested = GenerationQueue.Num();
+		GenerationQueue.RemoveAt(0, Requested - TerrainManagerPrivate::MaxDebugGridChunks, EAllowShrinking::Yes);
+		UE_LOG(LogTerrainManager, Warning,
+			TEXT("%s: GridRadius %d queues %d chunks. Keeping the %d nearest so the static grid does not exhaust memory."),
+			*GetName(), Radius, Requested, GenerationQueue.Num());
+	}
 
 	SetActorTickEnabled(!GenerationQueue.IsEmpty());
 }
@@ -389,6 +633,25 @@ void ATerrainManager::UpdateStreaming()
 		PlayerPoints.Add(WorldToChunkSpace(Location));
 	}
 
+	TArray<FIntPoint> Cells;
+	Cells.Reserve(PlayerPoints.Num());
+	for (const FVector2D& Point : PlayerPoints)
+	{
+		Cells.Add(FIntPoint(FMath::FloorToInt(Point.X), FMath::FloorToInt(Point.Y)));
+	}
+	Cells.Sort([](const FIntPoint& A, const FIntPoint& B)
+	{
+		return A.X < B.X || (A.X == B.X && A.Y < B.Y);
+	});
+
+	// The loaded ring only changes when a pawn enters another chunk. A settled ring is not scanned again.
+	if (bStreamingRingSettled && Cells == LastStreamingCells)
+	{
+		return;
+	}
+	LastStreamingCells = Cells;
+	bStreamingRingSettled = false;
+
 	const float LoadRadius = static_cast<float>(FMath::Max(StreamingRadius, 1));
 	const float LoadRadiusSq = FMath::Square(LoadRadius);
 	const float UnloadRadiusSq = FMath::Square(LoadRadius + static_cast<float>(FMath::Max(DespawnMargin, 1)));
@@ -418,12 +681,6 @@ void ATerrainManager::UpdateStreaming()
 	for (const FIntPoint& Coords : ToDespawn)
 	{
 		DespawnChunk(Coords);
-	}
-
-	// Physics only exists near players; the chunk ignores calls that do not change its state.
-	for (const TPair<FIntPoint, TObjectPtr<ATerrainChunk>>& Pair : ActiveChunks)
-	{
-		Pair.Value->SetCollisionEnabled(MinDistSqToPlayers(Pair.Key) <= CollisionRadiusSq);
 	}
 
 	// Missing chunks inside any player's load circle, keyed by distance to the nearest player.
@@ -492,6 +749,8 @@ void ATerrainManager::UpdateStreaming()
 			++SpawnedCount;
 		}
 	}
+
+	bStreamingRingSettled = ToDespawn.Num() == 0 && SpawnQueue.Num() == 0;
 
 	if (bLogStreaming && (SpawnedCount > 0 || ToDespawn.Num() > 0))
 	{
@@ -632,7 +891,9 @@ ATerrainChunk* ATerrainManager::SpawnChunk(const FIntPoint& Coords, bool bEnable
 	InitData.Coords = Coords;
 	InitData.bForceSynchronous = bForceSynchronous;
 
-	// Before InitializeChunk. A collision change after the build has started sets bRegenerationPending and runs a second build.
+	// The flag is only stored here. InitializeChunk uploads visual LODs once; crossing the collision
+	// radius later toggles the body and does not publish sections again.
+	Chunk->SetTerrainManager(this);
 	Chunk->SetCollisionEnabled(bEnableCollision);
 	Chunk->InitializeChunk(InitData);
 

@@ -4,16 +4,21 @@
 #include "PCGProceduralMeshSampler.h"
 #include "Modules/ModuleManager.h"
 
+void StartTerrainResidentDiagnostics();
+void StopTerrainResidentDiagnostics();
+
 class FMPSurvModule : public FDefaultGameModuleImpl
 {
 public:
 	virtual void StartupModule() override
 	{
 		RegisterMPSurvTerrainPointAccessors();
+		StartTerrainResidentDiagnostics();
 	}
 
 	virtual void ShutdownModule() override
 	{
+		StopTerrainResidentDiagnostics();
 		UnregisterMPSurvTerrainPointAccessors();
 	}
 };

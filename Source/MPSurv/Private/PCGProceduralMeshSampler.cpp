@@ -11,7 +11,6 @@
 #include "Metadata/PCGMetadataDomain.h"
 #include "Metadata/Accessors/PCGAttributeAccessorFactory.h"
 #include "Metadata/Accessors/PCGCustomAccessor.h"
-#include "ProceduralMeshComponent.h"
 #include "Modules/ModuleManager.h"
 #include "TerrainChunk.h"
 
@@ -21,56 +20,6 @@ namespace PCGProceduralMeshSamplerPrivate
 {
 	const FName BiomeIdAttributeName(TEXT("BiomeId"));
 	const FName NormalPropertyName(TEXT("Normal"));
-
-	/**
-	 * Surface vertices are the row-major grid written first: (QuadsPerSide + 1)^2 for that section's LOD.
-	 * Skirts and the later biome-corner copies are appended after it, so the prefix is the ground.
-	 */
-	int32 CountSurfaceVertices(const TArray<FProcMeshVertex>& Vertices)
-	{
-		if (Vertices.Num() == 0)
-		{
-			return 0;
-		}
-
-		const double RowY = Vertices[0].Position.Y;
-		int32 VerticesPerSide = 1;
-		while (VerticesPerSide < Vertices.Num() && FMath::IsNearlyEqual(Vertices[VerticesPerSide].Position.Y, RowY, 1.0))
-		{
-			++VerticesPerSide;
-		}
-
-		const int32 SurfaceCount = VerticesPerSide * VerticesPerSide;
-		return FMath::Clamp(SurfaceCount, 1, Vertices.Num());
-	}
-
-	const FProcMeshSection* FindTerrainSection(UProceduralMeshComponent* Mesh)
-	{
-		if (!Mesh)
-		{
-			return nullptr;
-		}
-
-		if (const FProcMeshSection* CollisionSection = Mesh->GetProcMeshSection(ATerrainChunk::CollisionSectionIndex))
-		{
-			if (CollisionSection->ProcVertexBuffer.Num() > 0)
-			{
-				return CollisionSection;
-			}
-		}
-
-		// Section 0 is always LOD 0 and is hidden while a coarser LOD is showing. Sample the visible one.
-		for (int32 LOD = 0; LOD < ATerrainChunk::NumLODs; ++LOD)
-		{
-			const FProcMeshSection* TerrainSection = Mesh->GetProcMeshSection(ATerrainChunk::TerrainSectionIndexForLOD(LOD));
-			if (TerrainSection && TerrainSection->bSectionVisible && TerrainSection->ProcVertexBuffer.Num() > 0)
-			{
-				return TerrainSection;
-			}
-		}
-
-		return nullptr;
-	}
 
 	void CollectActors(const FPCGContext* Context, TArray<AActor*>& OutActors)
 	{
@@ -149,7 +98,7 @@ FText UPCGProceduralMeshSamplerSettings::GetDefaultNodeTitle() const
 FText UPCGProceduralMeshSamplerSettings::GetNodeTooltipText() const
 {
 	return NSLOCTEXT("PCGProceduralMeshSampler", "NodeTooltip",
-		"Samples the terrain grid of a dynamic procedural mesh, skipping skirt vertices. $Normal is the vertex normal, and the point rotation Z matches it. BiomeId is the dominant packed biome.");
+		"Samples the 65x65 LOD 0 terrain grid cached on the chunk. $Normal is the vertex normal, and the point rotation Z matches it. BiomeId is the dominant packed biome.");
 }
 
 EPCGSettingsType UPCGProceduralMeshSamplerSettings::GetType() const
@@ -164,7 +113,7 @@ TArray<FPCGPinProperties> UPCGProceduralMeshSamplerSettings::InputPinProperties(
 	Pins.Emplace(PCGPinConstants::DefaultInputLabel, FPCGDataTypeIdentifier{EPCGDataType::Spatial},
 		/*bAllowMultipleConnections=*/true, /*bAllowMultipleData=*/true,
 		NSLOCTEXT("PCGProceduralMeshSampler", "InputPinTooltip",
-			"Spatial data whose target actor owns the procedural mesh. With no input, the PCG component owner is used."));
+			"Spatial data whose target actor is a terrain chunk. With no input, the PCG component owner is used."));
 	return Pins;
 }
 
@@ -174,7 +123,7 @@ TArray<FPCGPinProperties> UPCGProceduralMeshSamplerSettings::OutputPinProperties
 	Pins.Emplace(PCGPinConstants::DefaultOutputLabel, FPCGDataTypeIdentifier{EPCGDataType::Point},
 		/*bAllowMultipleConnections=*/true, /*bAllowMultipleData=*/true,
 		NSLOCTEXT("PCGProceduralMeshSampler", "OutputPinTooltip",
-			"One point per surface vertex. Normal is the vertex normal, and the point rotation Z matches it. BiomeId is the dominant biome."));
+			"One point per LOD 0 grid node. Normal is the vertex normal, and the point rotation Z matches it. BiomeId is the dominant biome."));
 	return Pins;
 }
 
@@ -207,23 +156,23 @@ bool FPCGProceduralMeshSamplerElement::ExecuteInternal(FPCGContext* Context) con
 			continue;
 		}
 
-		UProceduralMeshComponent* Mesh = Actor->FindComponentByClass<UProceduralMeshComponent>();
-		if (!IsValid(Mesh))
+		ATerrainChunk* Chunk = Cast<ATerrainChunk>(Actor);
+		if (!Chunk)
 		{
-			UE_LOG(LogPCGProceduralMeshSampler, Warning, TEXT("PCG_ProceduralMeshSampler: %s has no procedural mesh."), *Actor->GetName());
+			UE_LOG(LogPCGProceduralMeshSampler, Warning, TEXT("PCG_ProceduralMeshSampler: %s is not a terrain chunk."), *Actor->GetName());
 			continue;
 		}
 
-		const FProcMeshSection* Section = FindTerrainSection(Mesh);
-		if (!Section || Section->ProcVertexBuffer.Num() == 0)
+		const TArray<FTerrainGridSample>& Grid = Chunk->GetCachedLOD0Grid();
+		const int32 Side = ATerrainChunk::QuadsPerSide + 1;
+		if (Grid.Num() != Side * Side)
 		{
-			UE_LOG(LogPCGProceduralMeshSampler, Warning, TEXT("PCG_ProceduralMeshSampler: %s has no terrain vertices in section 0 or 2."), *Actor->GetName());
+			UE_LOG(LogPCGProceduralMeshSampler, Warning, TEXT("PCG_ProceduralMeshSampler: %s has no cached LOD 0 grid."), *Actor->GetName());
 			continue;
 		}
 
-		const TArray<FProcMeshVertex> Vertices = Section->ProcVertexBuffer;
-		const int32 SurfaceCount = CountSurfaceVertices(Vertices);
-		const FTransform MeshToWorld = Mesh->GetComponentTransform();
+		const int32 SurfaceCount = Grid.Num();
+		const FTransform MeshToWorld = Chunk->GetActorTransform();
 
 		UPCGBasePointData* PointData = FPCGContext::NewObject_AnyThread<UMPSurvTerrainPointData>(Context);
 		if (!PointData)
@@ -256,16 +205,19 @@ bool FPCGProceduralMeshSamplerElement::ExecuteInternal(FPCGContext* Context) con
 
 		for (int32 VertexIndex = 0; VertexIndex < SurfaceCount; ++VertexIndex)
 		{
-			const FProcMeshVertex& Vertex = Vertices[VertexIndex];
-			const FLinearColor LinearColor = Vertex.Color.ReinterpretAsLinear();
+			const FTerrainGridSample& Sample = Grid[VertexIndex];
+			const int32 GridX = VertexIndex % Side;
+			const int32 GridY = VertexIndex / Side;
+			const FVector LocalPosition(static_cast<double>(GridX) * ATerrainChunk::CellSize, static_cast<double>(GridY) * ATerrainChunk::CellSize, Sample.Height);
+			const FLinearColor LinearColor = Sample.VertexColor.ReinterpretAsLinear();
 
-			FVector WorldNormal = MeshToWorld.TransformVectorNoScale(Vertex.Normal).GetSafeNormal();
+			FVector WorldNormal = MeshToWorld.TransformVectorNoScale(Sample.Normal).GetSafeNormal();
 			if (WorldNormal.IsNearlyZero())
 			{
 				WorldNormal = FVector::UpVector;
 			}
 
-			const FVector WorldPosition = MeshToWorld.TransformPosition(Vertex.Position);
+			const FVector WorldPosition = MeshToWorld.TransformPosition(LocalPosition);
 			Transforms[VertexIndex] = FTransform(FRotationMatrix::MakeFromZ(WorldNormal).ToQuat(), WorldPosition);
 			Densities[VertexIndex] = 1.0f;
 			Seeds[VertexIndex] = VertexIndex;
@@ -277,7 +229,7 @@ bool FPCGProceduralMeshSamplerElement::ExecuteInternal(FPCGContext* Context) con
 				ElementsDomain->InitializeOnSet(MetadataEntries[VertexIndex]);
 				if (BiomeAttribute)
 				{
-					BiomeAttribute->SetValue(MetadataEntries[VertexIndex], static_cast<int32>(DecodeDominantBiome(Vertex.Color)));
+					BiomeAttribute->SetValue(MetadataEntries[VertexIndex], static_cast<int32>(DecodeDominantBiome(Sample.VertexColor)));
 				}
 			}
 		}

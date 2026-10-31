@@ -3,10 +3,11 @@
 #include "TerrainChunk.h"
 
 #include "Async/Async.h"
-#include "Camera/PlayerCameraManager.h"
+#include "Interface/Core/RealtimeMeshBuilder.h"
+#include "PhysicsEngine/BodySetup.h"
+#include "UObject/UnrealType.h"
 #include "CoreGlobals.h"
 #include "Engine/Engine.h"
-#include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "Materials/MaterialInterface.h"
@@ -14,6 +15,8 @@
 #include "PCGComponent.h"
 #include "TerrainManager.h"
 #include "TimerManager.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogTerrainChunk, Log, All);
 
 namespace TerrainChunkPrivate
 {
@@ -260,12 +263,6 @@ namespace TerrainChunkPrivate
 		return BestLake;
 	}
 
-	/** Height of grid vertex (X, Y) in a height cache that has a one-cell border. */
-	FORCEINLINE float CachedHeight(const TArray<float>& Heights, int32 HeightsPerSide, int32 X, int32 Y)
-	{
-		return Heights[(X + 1) + ((Y + 1) * HeightsPerSide)];
-	}
-
 	/** Appends the two up-facing triangles of a quad, split along the TL-BR or BL-TR diagonal. */
 	FORCEINLINE void AppendQuad(TArray<int32>& Triangles, int32 BottomLeft, int32 BottomRight, int32 TopLeft, int32 TopRight, bool bSplitAlongBLTR)
 	{
@@ -316,21 +313,6 @@ namespace TerrainChunkPrivate
 				AppendQuad(OutTriangles, BottomLeft, BottomRight, TopLeft, TopRight, SplitQuadCheckerboard(X, Y));
 			}
 		}
-	}
-
-	/** Height on a triangle given UV in the unit square and the three corner heights. */
-	FORCEINLINE float InterpolateTriangleHeight(float U0, float V0, float Z0, float U1, float V1, float Z1, float U2, float V2, float Z2, float U, float V)
-	{
-		const float Denom = (V1 - V2) * (U0 - U2) + (U2 - U1) * (V0 - V2);
-		if (FMath::Abs(Denom) < KINDA_SMALL_NUMBER)
-		{
-			return (Z0 + Z1 + Z2) * (1.0f / 3.0f);
-		}
-
-		const float W0 = ((V1 - V2) * (U - U2) + (U2 - U1) * (V - V2)) / Denom;
-		const float W1 = ((V2 - V0) * (U - U2) + (U0 - U2) * (V - V2)) / Denom;
-		const float W2 = 1.0f - W0 - W1;
-		return W0 * Z0 + W1 * Z1 + W2 * Z2;
 	}
 
 	/**
@@ -413,83 +395,71 @@ namespace TerrainChunkPrivate
 	}
 
 	/**
-	 * Samples LOD-0 terrain at a local XY: dominant biome from the packed vertex colour, height on the adaptive
-	 * triangle plane, bilinear normal. Returns false if the buffer is not a usable LOD-0 grid.
+	 * Height and normal are bilinear across the four LOD 0 nodes around a local XY.
+	 * Strict biome is the node with the largest bilinear weight: an id has no meaningful blend.
+	 * Grid is the inner 65×65, index 0 at the chunk origin, one sample per CellSize.
 	 */
-	bool SampleLod0Surface(const FTerrainMeshBuffers& Lod0, float LocalX, float LocalY, uint8& OutBiomeId, float& OutHeight,
-		FVector& OutNormal)
+	void SampleCachedLOD0Grid(const TArray<FTerrainGridSample>& Grid, int32 VerticesPerSide, float CellSize,
+		float LocalX, float LocalY, uint8& OutBiomeId, float& OutHeight, FVector& OutNormal)
 	{
-		const int32 QuadCount = Lod0.QuadCount;
-		if (QuadCount <= 0 || Lod0.Step <= 0.0f || Lod0.Heights.Num() == 0 || Lod0.Normals.Num() == 0 || Lod0.Colors.Num() == 0)
-		{
-			return false;
-		}
+		const float MaxLocal = CellSize * static_cast<float>(VerticesPerSide - 1);
+		const float ClampedX = FMath::Clamp(LocalX, 0.0f, MaxLocal);
+		const float ClampedY = FMath::Clamp(LocalY, 0.0f, MaxLocal);
+		const float GridX = ClampedX / CellSize;
+		const float GridY = ClampedY / CellSize;
+		const int32 X0 = FMath::Clamp(FMath::FloorToInt(GridX), 0, VerticesPerSide - 2);
+		const int32 Y0 = FMath::Clamp(FMath::FloorToInt(GridY), 0, VerticesPerSide - 2);
+		const float FracX = FMath::Clamp(GridX - static_cast<float>(X0), 0.0f, 1.0f);
+		const float FracY = FMath::Clamp(GridY - static_cast<float>(Y0), 0.0f, 1.0f);
 
-		const int32 VerticesPerSide = QuadCount + 1;
-		const int32 GridVertexCount = VerticesPerSide * VerticesPerSide;
-		if (Lod0.Normals.Num() < GridVertexCount || Lod0.Colors.Num() < GridVertexCount)
-		{
-			return false;
-		}
+		const FTerrainGridSample& S00 = Grid[X0 + Y0 * VerticesPerSide];
+		const FTerrainGridSample& S10 = Grid[(X0 + 1) + Y0 * VerticesPerSide];
+		const FTerrainGridSample& S01 = Grid[X0 + (Y0 + 1) * VerticesPerSide];
+		const FTerrainGridSample& S11 = Grid[(X0 + 1) + (Y0 + 1) * VerticesPerSide];
 
-		const float Step = Lod0.Step;
-		const float MaxLocal = Step * static_cast<float>(QuadCount);
-		const float ClampedX = FMath::Clamp(LocalX, 0.0f, MaxLocal - KINDA_SMALL_NUMBER);
-		const float ClampedY = FMath::Clamp(LocalY, 0.0f, MaxLocal - KINDA_SMALL_NUMBER);
+		OutHeight = FMath::Lerp(
+			FMath::Lerp(S00.Height, S10.Height, FracX),
+			FMath::Lerp(S01.Height, S11.Height, FracX),
+			FracY);
 
-		const float GridX = ClampedX / Step;
-		const float GridY = ClampedY / Step;
-		const int32 QuadX = FMath::Clamp(FMath::FloorToInt(GridX), 0, QuadCount - 1);
-		const int32 QuadY = FMath::Clamp(FMath::FloorToInt(GridY), 0, QuadCount - 1);
-		const float FracX = FMath::Clamp(GridX - static_cast<float>(QuadX), 0.0f, 1.0f);
-		const float FracY = FMath::Clamp(GridY - static_cast<float>(QuadY), 0.0f, 1.0f);
-
-		const int32 NearX = QuadX + (FracX >= 0.5f ? 1 : 0);
-		const int32 NearY = QuadY + (FracY >= 0.5f ? 1 : 0);
-		OutBiomeId = DecodeDominantBiome(Lod0.Colors[NearX + NearY * VerticesPerSide]);
-
-		const float Z00 = CachedHeight(Lod0.Heights, Lod0.HeightsPerSide, QuadX, QuadY);
-		const float Z10 = CachedHeight(Lod0.Heights, Lod0.HeightsPerSide, QuadX + 1, QuadY);
-		const float Z01 = CachedHeight(Lod0.Heights, Lod0.HeightsPerSide, QuadX, QuadY + 1);
-		const float Z11 = CachedHeight(Lod0.Heights, Lod0.HeightsPerSide, QuadX + 1, QuadY + 1);
-
-		// Same diagonal as BuildTerrainTriangles, so a height probe lands on the triangle that is drawn.
-		const bool bSplitAlongBLTR = SplitQuadCheckerboard(QuadX, QuadY);
-		if (bSplitAlongBLTR)
-		{
-			// Diagonal BL-TR. FracX <= FracY → BL-TL-TR, else BL-TR-BR.
-			OutHeight = (FracX <= FracY)
-				? InterpolateTriangleHeight(0.0f, 0.0f, Z00, 0.0f, 1.0f, Z01, 1.0f, 1.0f, Z11, FracX, FracY)
-				: InterpolateTriangleHeight(0.0f, 0.0f, Z00, 1.0f, 1.0f, Z11, 1.0f, 0.0f, Z10, FracX, FracY);
-		}
-		else
-		{
-			// Diagonal TL-BR. FracX + FracY <= 1 → BL-TL-BR, else BR-TL-TR.
-			OutHeight = (FracX + FracY <= 1.0f)
-				? InterpolateTriangleHeight(0.0f, 0.0f, Z00, 0.0f, 1.0f, Z01, 1.0f, 0.0f, Z10, FracX, FracY)
-				: InterpolateTriangleHeight(1.0f, 0.0f, Z10, 0.0f, 1.0f, Z01, 1.0f, 1.0f, Z11, FracX, FracY);
-		}
-
-		const int32 I00 = QuadX + QuadY * VerticesPerSide;
-		const int32 I10 = I00 + 1;
-		const int32 I01 = I00 + VerticesPerSide;
-		const int32 I11 = I01 + 1;
 		OutNormal = FMath::Lerp(
-			FMath::Lerp(Lod0.Normals[I00], Lod0.Normals[I10], FracX),
-			FMath::Lerp(Lod0.Normals[I01], Lod0.Normals[I11], FracX),
+			FMath::Lerp(S00.Normal, S10.Normal, FracX),
+			FMath::Lerp(S01.Normal, S11.Normal, FracX),
 			FracY).GetSafeNormal();
+		if (OutNormal.IsNearlyZero())
+		{
+			OutNormal = FVector::UpVector;
+		}
 
-		return true;
+		const float Weight00 = (1.0f - FracX) * (1.0f - FracY);
+		const float Weight10 = FracX * (1.0f - FracY);
+		const float Weight01 = (1.0f - FracX) * FracY;
+		const float Weight11 = FracX * FracY;
+
+		float BestWeight = Weight00;
+		OutBiomeId = S00.StrictBiome;
+		auto Consider = [&BestWeight, &OutBiomeId](float Weight, uint8 BiomeId)
+		{
+			if (Weight > BestWeight || (Weight == BestWeight && BiomeId < OutBiomeId))
+			{
+				BestWeight = Weight;
+				OutBiomeId = BiomeId;
+			}
+		};
+		Consider(Weight10, S10.StrictBiome);
+		Consider(Weight01, S01.StrictBiome);
+		Consider(Weight11, S11.StrictBiome);
 	}
+
+	using FTerrainStreamBuilder = RealtimeMesh::TRealtimeMeshBuilderLocal<uint32, FPackedNormal, FVector2f, 1>;
 
 	/**
 	 * Appends a skirt around the grid perimeter: every edge vertex is duplicated SkirtDepth lower and joined to
 	 * its original by outward-facing quads. Skirt vertices copy the edge normal and biome colour, so the wall shades
 	 * like the surface edge and hides cracks against a neighbour at another LOD.
 	 */
-	void AppendSkirts(FTerrainMeshBuffers& Buffers, float SkirtDepth)
+	void AppendSkirts(FTerrainStreamBuilder& Builder, int32 QuadCount, float Step, float SkirtDepth)
 	{
-		const int32 QuadCount = Buffers.QuadCount;
 		const int32 VerticesPerSide = QuadCount + 1;
 
 		// Perimeter loop walked counter-clockwise seen from above (+X, +Y, -X, -Y), so "outward" is always
@@ -515,10 +485,9 @@ namespace TerrainChunkPrivate
 
 		// Skirt UVs continue outward by the skirt depth at the surface UV scale, so the wall shows texture
 		// instead of a single edge texel stretched down its full height.
-		const float SkirtUVOffset = SkirtDepth / (static_cast<float>(QuadCount) * Buffers.Step);
-		const bool bHasColors = Buffers.Colors.Num() == Buffers.Vertices.Num();
+		const float SkirtUVOffset = SkirtDepth / (static_cast<float>(QuadCount) * Step);
 
-		const int32 FirstSkirtVertex = Buffers.Vertices.Num();
+		const int32 FirstSkirtVertex = Builder.NumVertices();
 		for (const int32 EdgeVertex : Perimeter)
 		{
 			const int32 GridX = EdgeVertex % VerticesPerSide;
@@ -526,40 +495,29 @@ namespace TerrainChunkPrivate
 			const float OutwardX = GridX == 0 ? -1.0f : (GridX == QuadCount ? 1.0f : 0.0f);
 			const float OutwardY = GridY == 0 ? -1.0f : (GridY == QuadCount ? 1.0f : 0.0f);
 
-			// Copied first: TArray::Add rejects a reference into the array being grown.
-			const FVector SkirtPosition = Buffers.Vertices[EdgeVertex] - FVector(0.0f, 0.0f, SkirtDepth);
-			const FVector EdgeNormal = Buffers.Normals[EdgeVertex];
-			const FVector2D SkirtUV = Buffers.UVs[EdgeVertex] + FVector2D(OutwardX, OutwardY) * SkirtUVOffset;
-			const FProcMeshTangent EdgeTangent = Buffers.Tangents[EdgeVertex];
+			const FVector3f EdgePosition = Builder.GetPosition(EdgeVertex);
+			const FVector3f EdgeNormal = Builder.GetNormal(EdgeVertex);
+			const FVector3f EdgeTangent = Builder.GetTangent(EdgeVertex);
+			const FVector2f EdgeUV = Builder.GetTexCoord(EdgeVertex, 0);
+			const FColor EdgeColor = Builder.GetColor(EdgeVertex);
 
-			Buffers.Vertices.Add(SkirtPosition);
-			Buffers.Normals.Add(EdgeNormal);
-			Buffers.UVs.Add(SkirtUV);
-			Buffers.Tangents.Add(EdgeTangent);
-
-			if (bHasColors)
-			{
-				const FColor EdgeColor = Buffers.Colors[EdgeVertex];
-				Buffers.Colors.Add(EdgeColor);
-			}
+			const uint32 SkirtIndex = Builder.AddVertex(EdgePosition - FVector3f(0.0f, 0.0f, SkirtDepth));
+			Builder.SetNormalAndTangent(SkirtIndex, EdgeNormal, EdgeTangent);
+			Builder.SetTexCoord(SkirtIndex, 0, EdgeUV + FVector2f(OutwardX, OutwardY) * SkirtUVOffset);
+			Builder.SetColor(SkirtIndex, EdgeColor);
 		}
 
 		const int32 LoopLength = Perimeter.Num();
 		for (int32 Index = 0; Index < LoopLength; ++Index)
 		{
 			const int32 NextIndex = (Index + 1) % LoopLength;
-			const int32 TopA = Perimeter[Index];
-			const int32 TopB = Perimeter[NextIndex];
-			const int32 BottomA = FirstSkirtVertex + Index;
-			const int32 BottomB = FirstSkirtVertex + NextIndex;
+			const uint32 TopA = Perimeter[Index];
+			const uint32 TopB = Perimeter[NextIndex];
+			const uint32 BottomA = FirstSkirtVertex + Index;
+			const uint32 BottomB = FirstSkirtVertex + NextIndex;
 
-			Buffers.Triangles.Add(TopA);
-			Buffers.Triangles.Add(TopB);
-			Buffers.Triangles.Add(BottomA);
-
-			Buffers.Triangles.Add(TopB);
-			Buffers.Triangles.Add(BottomB);
-			Buffers.Triangles.Add(BottomA);
+			Builder.AddTriangle(TopA, TopB, BottomA);
+			Builder.AddTriangle(TopB, BottomB, BottomA);
 		}
 	}
 
@@ -649,20 +607,15 @@ namespace TerrainChunkPrivate
 	 * and B is pinned to 0 or 255. The copy is not shared with a neighbor triangle of a different pair, so the
 	 * rasterizer cannot interpolate IDs along that edge.
 	 */
-	void SplitInconsistentBiomeTriangles(FTerrainMeshBuffers& Buffers)
+	void SplitInconsistentBiomeTriangles(FTerrainStreamBuilder& Builder)
 	{
 		TMap<FBiomeVertexCopyKey, int32> Copies;
-		TArray<int32>& Triangles = Buffers.Triangles;
 
-		for (int32 Triangle = 0; Triangle + 2 < Triangles.Num(); Triangle += 3)
+		for (int32 Triangle = 0; Triangle < Builder.NumTriangles(); ++Triangle)
 		{
-			const int32 CornerIndex[3] = {Triangles[Triangle], Triangles[Triangle + 1], Triangles[Triangle + 2]};
-			if (!Buffers.Colors.IsValidIndex(CornerIndex[0]) || !Buffers.Colors.IsValidIndex(CornerIndex[1]) || !Buffers.Colors.IsValidIndex(CornerIndex[2]))
-			{
-				continue;
-			}
-
-			const FColor CornerColor[3] = {Buffers.Colors[CornerIndex[0]], Buffers.Colors[CornerIndex[1]], Buffers.Colors[CornerIndex[2]]};
+			const RealtimeMesh::TIndex3<uint32> Corners = Builder.GetTriangle(Triangle);
+			const int32 CornerIndex[3] = { static_cast<int32>(Corners.V0), static_cast<int32>(Corners.V1), static_cast<int32>(Corners.V2) };
+			const FColor CornerColor[3] = { Builder.GetColor(CornerIndex[0]), Builder.GetColor(CornerIndex[1]), Builder.GetColor(CornerIndex[2]) };
 			if (CornerColor[0].R == CornerColor[1].R && CornerColor[0].G == CornerColor[1].G
 				&& CornerColor[0].R == CornerColor[2].R && CornerColor[0].G == CornerColor[2].G)
 			{
@@ -696,6 +649,11 @@ namespace TerrainChunkPrivate
 				Winner = FColor(LowId, HighId, 0, 255);
 			}
 
+			uint32 CornerWrite[3] = {
+				static_cast<uint32>(CornerIndex[0]),
+				static_cast<uint32>(CornerIndex[1]),
+				static_cast<uint32>(CornerIndex[2])
+			};
 			for (int32 Corner = 0; Corner < 3; ++Corner)
 			{
 				const FColor Color = CornerColor[Corner];
@@ -707,25 +665,26 @@ namespace TerrainChunkPrivate
 				const uint8 Dominant = DecodeDominantBiome(Color);
 				const uint8 PinnedB = Dominant == Winner.G ? 255 : 0;
 				const FBiomeVertexCopyKey Key{CornerIndex[Corner], Winner.R, Winner.G, PinnedB};
+				int32 CopyIndex;
 				if (const int32* Existing = Copies.Find(Key))
 				{
-					Triangles[Triangle + Corner] = *Existing;
-					continue;
+					CopyIndex = *Existing;
+				}
+				else
+				{
+					const int32 Source = CornerIndex[Corner];
+					const uint32 Added = Builder.AddVertex(Builder.GetPosition(Source));
+					Builder.SetNormalAndTangent(Added, Builder.GetNormal(Source), Builder.GetTangent(Source));
+					Builder.SetTexCoord(Added, 0, Builder.GetTexCoord(Source, 0));
+					Builder.SetColor(Added, FColor(Winner.R, Winner.G, PinnedB, 255));
+					CopyIndex = static_cast<int32>(Added);
+					Copies.Add(Key, CopyIndex);
 				}
 
-				const int32 Source = CornerIndex[Corner];
-				const FVector Position = Buffers.Vertices[Source];
-				const FVector Normal = Buffers.Normals[Source];
-				const FVector2D UV = Buffers.UVs[Source];
-				const FProcMeshTangent Tangent = Buffers.Tangents[Source];
-				const int32 CopyIndex = Buffers.Vertices.Add(Position);
-				Buffers.Normals.Add(Normal);
-				Buffers.UVs.Add(UV);
-				Buffers.Tangents.Add(Tangent);
-				Buffers.Colors.Add(FColor(Winner.R, Winner.G, PinnedB, 255));
-				Copies.Add(Key, CopyIndex);
-				Triangles[Triangle + Corner] = CopyIndex;
+				CornerWrite[Corner] = static_cast<uint32>(CopyIndex);
 			}
+
+			Builder.SetTriangle(Triangle, CornerWrite[0], CornerWrite[1], CornerWrite[2]);
 		}
 	}
 }
@@ -765,21 +724,29 @@ public:
 	/** Collects the validated lakes that can reach the chunk or its height border. Call before building geometry. */
 	void CacheChunkLakes();
 
-	/** Heights, triangles, vertex attributes and biome colours of the chunk grid at a LOD, optionally with skirts. */
-	/** Builds terrain geometry at the requested LOD. No UObject access. */
-	void BuildTerrainBuffers(int32 LOD, bool bWithSkirts, FTerrainMeshBuffers& OutBuffers) const;
+	/**
+	 * One ComputeHeight pass over the 67×67 full-detail grid, including the one-cell border.
+	 * Normals, tangents and the harmonized biome pair are stored on each interior node.
+	 */
+	void CacheSurfaceGrid();
+
+	/** Copies the inner 65×65 of SurfaceGrid, without the border. */
+	void CopyInnerLOD0Grid(TArray<FTerrainGridSample>& OutGrid) const;
+
+	/** One visual LOD written straight into a stream set. No ComputeHeight. No UObject access. */
+	RealtimeMesh::FRealtimeMeshStreamSet BuildTerrainStreams(int32 LOD, bool bWithSkirts) const;
 
 	/**
-	 * Independent grass grid per biome (SpawnStep). Samples height, biome and normals from an already-built LOD-0
-	 * terrain buffer (skirts ignored). Fills local-space transforms and wind phases. No UObject access.
+	 * Independent grass grid per biome (SpawnStep). Height, normal and strict biome come from the inner 65×65 grid.
+	 * Perlin noise is only the density mask. Fills local-space transforms and wind phases. No UObject access.
 	 */
-	void BuildGrassTransforms(const FTerrainMeshBuffers& Lod0Terrain, TMap<uint8, TArray<FTransform>>& OutTransforms,
+	void BuildGrassTransforms(const TArray<FTerrainGridSample>& Lod0Grid, TMap<uint8, TArray<FTransform>>& OutTransforms,
 		TMap<uint8, TArray<float>>& OutWindPhases) const;
 
 	TArray<FBiomeGrassSpawnRule> GrassRules;
 
-	/** Sea and lake surfaces over the given terrain grid; empty buffers where no water reaches the chunk. */
-	void BuildWaterBuffers(const FTerrainMeshBuffers& Terrain, FTerrainMeshBuffers& OutWater) const;
+	/** Sea and lake surfaces for one LOD, written straight into a stream set. Empty when the chunk is dry. */
+	RealtimeMesh::FRealtimeMeshStreamSet BuildWaterStreams(int32 LOD) const;
 
 private:
 	static constexpr int32 NumLODs = ATerrainChunk::NumLODs;
@@ -887,6 +854,9 @@ private:
 	float ChunkWorldSize;
 	TArray<FMountainLakeData> ChunkLakes;
 
+	/** 67×67 full-detail samples, row-major, one-cell border included. Filled by CacheSurfaceGrid. */
+	TArray<FTerrainGridSample> SurfaceGrid;
+
 	/** Continentalness added at the world origin; scaled by ComputeStartIslandBias elsewhere. */
 	float StartIslandLift = 0.0f;
 };
@@ -897,24 +867,34 @@ ATerrainChunk::ATerrainChunk()
 
 	bReplicates = true;
 	SetReplicateMovement(false);
+	SetNetDormancy(DORM_DormantAll);
 
-	ProceduralMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("ProceduralMesh"));
-	SetRootComponent(ProceduralMesh);
+	RealtimeMeshComponent = CreateDefaultSubobject<URealtimeMeshComponent>(TEXT("RealtimeMesh"));
+	SetRootComponent(RealtimeMeshComponent);
 	// Movable until the first mesh upload. The pool teleports this actor; Stationary cannot move.
-	ProceduralMesh->SetMobility(EComponentMobility::Movable);
-	ProceduralMesh->bUseAsyncCooking = true;
-	ProceduralMesh->bUseComplexAsSimpleCollision = true;
-	ProceduralMesh->SetCollisionProfileName(TEXT("BlockAll"));
-	// Primitives start with CastShadow off. Dynamic shadow is the CSM/VSM caster flag; receivers are shaded in the base pass.
-	ProceduralMesh->SetCastShadow(true);
-	ProceduralMesh->bCastDynamicShadow = true;
+	RealtimeMeshComponent->SetMobility(EComponentMobility::Movable);
+	RealtimeMeshComponent->SetIsReplicated(false);
+	RealtimeMeshComponent->SetCollisionProfileName(TEXT("BlockAll"));
+	RealtimeMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	RealtimeMeshComponent->SetCanEverAffectNavigation(false);
+	RealtimeMeshComponent->SetCastShadow(true);
+	RealtimeMeshComponent->bCastDynamicShadow = true;
+	RealtimeMeshComponent->bCastStaticShadow = true;
+	RealtimeMeshComponent->bAffectDistanceFieldLighting = false;
+
+	// The class default is constructed with this same constructor. A mesh created there is a template and
+	// has no shared mesh data, so the bounds update inside InitializeRealtimeMesh asserts.
+	if (!IsTemplate())
+	{
+		AttachRealtimeMesh();
+	}
 
 	// PCG stays idle until GeneratePCG: the chunk has no surface to scatter on before its first mesh build.
 	PCGComponent = CreateDefaultSubobject<UPCGComponent>(TEXT("PCGComponent"));
 	PCGComponent->bActivated = false;
 	PCGComponent->GenerationTrigger = EPCGComponentGenerationTrigger::GenerateOnDemand;
 
-	// Clients pick their own LOD out to several hundred metres, so chunks must replicate far beyond the default cull distance.
+	// Streaming clients still need InitData well beyond the default net cull.
 	SetNetCullDistanceSquared(FMath::Square(16.0f * ChunkWorldSize));
 }
 
@@ -927,47 +907,60 @@ void ATerrainChunk::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLif
 
 void ATerrainChunk::ResetChunkState()
 {
-	// Drop the budget slot before the serial bump. The worker result is discarded, and its callback must not
-	// release a slot a later build of this actor has taken.
-	ReleaseVisualLODSlot();
-	if (UWorld* World = GetWorld())
-	{
-		World->GetTimerManager().ClearTimer(VisualLODRetryHandle);
-	}
-	bVisualLODRetryScheduled = false;
-
 	// Any build already on a worker carries the old serial and is dropped in OnBuildComplete. The callback itself
 	// clears bIsGenerating; clearing it here would let a reuse start a second build beside the one still running.
 	++BuildSerial;
 	bRegenerationPending = false;
 	bHasGeneratedMesh = false;
 	bVisualLODsReady = false;
+	UploadedVisualSeed = 0;
+	UploadedVisualCoords = FIntPoint(MIN_int32, MIN_int32);
 	bPCGGenerated = false;
 
 	// Seed 0 is the pooled state. Replicating it forces OnRep even when the chunk is later reused at the same coordinates.
+	if (HasAuthority())
+	{
+		FlushNetDormancy();
+	}
 	InitData = FChunkInitData();
 
 	SetActorHiddenInGame(true);
 	SetActorEnableCollision(false);
 
-	if (ProceduralMesh)
+	bCollisionCooked = false;
+	bCollisionApplied = false;
+	++CollisionUpdateSerial;
+	if (RealtimeMesh)
 	{
-		ProceduralMesh->ClearAllMeshSections();
-	}
-
-	for (const TPair<uint8, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>>& HISMPair : BiomeGrassHISMs)
-	{
-		if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = HISMPair.Value.Get(); IsValid(GrassHISM))
+		UBodySetup* BodyBeforeReset = RealtimeMesh->GetBodySetup();
+		RealtimeMesh->ClearCustomComplexMeshGeometry();
+		UBodySetup* BodyAfterClear = RealtimeMesh->GetBodySetup();
+		RealtimeMesh->Reset();
+		if (BodyBeforeReset)
 		{
-			GrassHISM->ClearInstances();
-			if (GrassHISM->IsRegistered())
-			{
-				GrassHISM->UnregisterComponent();
-			}
+			BodyBeforeReset->InvalidatePhysicsData();
+			BodyBeforeReset->MarkAsGarbage();
+		}
+		if (BodyAfterClear && BodyAfterClear != BodyBeforeReset)
+		{
+			BodyAfterClear->InvalidatePhysicsData();
+			BodyAfterClear->MarkAsGarbage();
 		}
 	}
-	bGrassBuilt = false;
-	bCollisionApplied = false;
+	if (RealtimeMesh)
+	{
+		DestroyMeshBodySetup();
+	}
+	if (RealtimeMeshComponent)
+	{
+		RealtimeMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	}
+
+	ReleaseGrassInstances();
+	bGrassCacheReady = false;
+	CachedLOD0Grid.Reset();
+	CachedGrassTransforms.Reset();
+	CachedGrassWindPhases.Reset();
 
 	if (IsValid(PCGComponent))
 	{
@@ -977,16 +970,22 @@ void ATerrainChunk::ResetChunkState()
 
 void ATerrainChunk::PrepareChunkForTeleport()
 {
-	if (ProceduralMesh && ProceduralMesh->GetMobility() != EComponentMobility::Movable)
+	if (!RealtimeMeshComponent || RealtimeMeshComponent->GetMobility() == EComponentMobility::Movable)
 	{
-		// Also pushes attached grass to Movable. SettleChunkMobility puts it back.
-		ProceduralMesh->SetMobility(EComponentMobility::Movable);
+		return;
 	}
+
+	// Drop the proxy first. SetMobility(Movable) on a live mesh would build a second one and throw it away.
+	if (RealtimeMeshComponent->GetRealtimeMesh() != nullptr)
+	{
+		RealtimeMeshComponent->SetRealtimeMesh(nullptr);
+	}
+	RealtimeMeshComponent->SetMobility(EComponentMobility::Movable);
 }
 
 void ATerrainChunk::SettleChunkMobility()
 {
-	if (!ProceduralMesh)
+	if (!RealtimeMeshComponent)
 	{
 		return;
 	}
@@ -1003,9 +1002,9 @@ void ATerrainChunk::SettleChunkMobility()
 		}
 	}
 
-	if (ProceduralMesh->GetMobility() != EComponentMobility::Stationary)
+	if (RealtimeMeshComponent->GetMobility() != EComponentMobility::Stationary)
 	{
-		ProceduralMesh->SetMobility(EComponentMobility::Stationary);
+		RealtimeMeshComponent->SetMobility(EComponentMobility::Stationary);
 	}
 }
 
@@ -1019,7 +1018,13 @@ void ATerrainChunk::PlaceAtChunkCoords()
 	SetActorLocation(ChunkLocation);
 	SetActorHiddenInGame(false);
 	SetActorEnableCollision(true);
-	SettleChunkMobility();
+
+	// Stay Movable until the mesh is uploaded. SetMobility(Stationary) reregisters the primitive, and doing
+	// that on the empty mesh crashes in the renderer during deferred spawn.
+	if (RealtimeMeshComponent)
+	{
+		RealtimeMeshComponent->UpdateComponentToWorld(EUpdateTransformFlags::None, ETeleportType::TeleportPhysics);
+	}
 }
 
 void ATerrainChunk::InitializeChunk(const FChunkInitData& InData)
@@ -1029,8 +1034,27 @@ void ATerrainChunk::InitializeChunk(const FChunkInitData& InData)
 		return;
 	}
 
+	FlushNetDormancy();
 	InitData = InData;
 	PlaceAtChunkCoords();
+
+	// The sections for this cell are already published. Radius changes only toggle collision and grass.
+	if (bVisualLODsReady && UploadedVisualSeed == InitData.Seed && UploadedVisualCoords == InitData.Coords)
+	{
+		RefreshCollisionState();
+		if (NeedsDetailRefresh())
+		{
+			if (ATerrainManager* Manager = GetTerrainManager())
+			{
+				Manager->EnqueueDetailRefresh(this);
+			}
+			else
+			{
+				RefreshDetailState();
+			}
+		}
+		return;
+	}
 
 	// A second increment on top of ResetChunkState. If a worker is still running, GenerateTerrainMesh only raises
 	// bRegenerationPending; OnBuildComplete then starts the build for these coordinates.
@@ -1039,43 +1063,112 @@ void ATerrainChunk::InitializeChunk(const FChunkInitData& InData)
 	bHasGeneratedMesh = false;
 	bVisualLODsReady = false;
 	bGrassBuilt = false;
+	bGrassCacheReady = false;
+	CachedLOD0Grid.Reset();
+	CachedGrassTransforms.Reset();
+	CachedGrassWindPhases.Reset();
+	bCollisionCooked = false;
+	bCollisionApplied = false;
+	++CollisionUpdateSerial;
 	ClearAllGrassInstances();
 	if (IsValid(PCGComponent))
 	{
 		PCGComponent->CleanupLocalImmediate(/*bRemoveComponents=*/true);
 	}
 
-	CurrentLOD = ComputeTargetLOD(false);
 	GenerateTerrainMesh();
+}
+
+void ATerrainChunk::AttachRealtimeMesh()
+{
+	if (!RealtimeMeshComponent || IsTemplate())
+	{
+		return;
+	}
+
+	// The component is replicated by default. A null replicated mesh would replace the local one.
+	RealtimeMeshComponent->SetIsReplicated(false);
+
+	if (!RealtimeMesh)
+	{
+		// NewObject, not InitializeRealtimeMesh: that setter publishes the mesh and the renderer
+		// builds a scene proxy before any section exists.
+		RealtimeMesh = NewObject<URealtimeMeshSimple>(RealtimeMeshComponent);
+		SetupMeshMaterials();
+	}
+
+	if (!bVisualLODsReady)
+	{
+		// CreateSceneProxy runs as soon as the component points at a mesh. An empty proxy crashes
+		// FPrimitiveSceneInfo when it calls GetInstanceDataUpdateTaskInfo.
+		// The authoritative server never builds sections, but its body setup lives on this mesh.
+		// Clearing the pointer there leaves the pawn with nothing to stand on.
+		const bool bServerNeedsBody = IsNetMode(NM_DedicatedServer);
+		if (!bServerNeedsBody && RealtimeMeshComponent->GetRealtimeMesh() != nullptr)
+		{
+			RealtimeMeshComponent->SetRealtimeMesh(nullptr);
+		}
+	}
+	else if (RealtimeMeshComponent->GetRealtimeMesh() != RealtimeMesh)
+	{
+		// Stationary before the pointer is set, so the first proxy is not created Movable and rebuilt.
+		if (RealtimeMeshComponent->GetMobility() != EComponentMobility::Stationary)
+		{
+			RealtimeMeshComponent->SetMobility(EComponentMobility::Stationary);
+		}
+		UE_LOG(LogTerrainChunk, Warning, TEXT("%s: publishing %s after the sections exist at (%d, %d)."),
+			*GetName(), *RealtimeMesh->GetName(), InitData.Coords.X, InitData.Coords.Y);
+		RealtimeMeshComponent->SetRealtimeMesh(RealtimeMesh);
+	}
+	else
+	{
+		SettleChunkMobility();
+	}
+
+	// Movable until the sections exist, so a pool teleport can still move the root. The publish path
+	// above already settled a ready mesh to Stationary. Forcing Movable after that rebuilds the
+	// body as dynamic, and a dynamic body does not keep the triangle mesh the pawn stands on.
+	if (!bVisualLODsReady && RealtimeMeshComponent->GetMobility() != EComponentMobility::Movable)
+	{
+		RealtimeMeshComponent->SetMobility(EComponentMobility::Movable);
+	}
+}
+
+void ATerrainChunk::OnConstruction(const FTransform& Transform)
+{
+	Super::OnConstruction(Transform);
+	AttachRealtimeMesh();
+}
+
+void ATerrainChunk::PostRegisterAllComponents()
+{
+	Super::PostRegisterAllComponents();
+
+	// Synchronous pre-spawn fills the mesh before FinishSpawning registers this component.
+	// Refreshing before that upload reregisters an empty proxy and crashes in the renderer.
+	AttachRealtimeMesh();
+	if (bVisualLODsReady)
+	{
+		RefreshRenderedMesh();
+	}
 }
 
 void ATerrainChunk::BeginPlay()
 {
 	Super::BeginPlay();
+	AttachRealtimeMesh();
 
 	if (InitData.Seed != 0 && !bHasGeneratedMesh && !bIsGenerating)
 	{
-		CurrentLOD = ComputeTargetLOD(false);
 		GenerateTerrainMesh();
 	}
 
-	// Every machine that renders (client, standalone, listen server) picks its own visual LOD.
-	if (!IsNetMode(NM_DedicatedServer))
-	{
-		const float Interval = FMath::Max(LODUpdateInterval, 0.05f);
-
-		// A random first delay spreads the checks of chunks spawned on the same frame across the interval.
-		GetWorldTimerManager().SetTimer(LODTimerHandle, this, &ATerrainChunk::UpdateVisualLOD, Interval, true, FMath::FRandRange(0.0f, Interval));
-	}
+	// The synchronous pre-spawn builds the mesh before FinishSpawning registers the component.
+	RefreshRenderedMesh();
 }
 
 void ATerrainChunk::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	ReleaseVisualLODSlot();
-	GetWorldTimerManager().ClearTimer(LODTimerHandle);
-	GetWorldTimerManager().ClearTimer(VisualLODRetryHandle);
-	bVisualLODRetryScheduled = false;
-
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -1088,28 +1181,51 @@ void ATerrainChunk::OnRep_InitData()
 		return;
 	}
 
-	// The build already on a worker belongs to the previous coordinates. Its upload is discarded, and the mesh
-	// started below is the first one for this InitData, which stays outside the visual LOD budget.
-	ReleaseVisualLODSlot();
-
+	// The build already on a worker belongs to the previous coordinates. Its upload is discarded.
 	PlaceAtChunkCoords();
 
 	++BuildSerial;
 	bPCGGenerated = false;
 	bHasGeneratedMesh = false;
 	bVisualLODsReady = false;
+	UploadedVisualSeed = 0;
+	UploadedVisualCoords = FIntPoint(MIN_int32, MIN_int32);
 	bGrassBuilt = false;
+	bGrassCacheReady = false;
+	CachedLOD0Grid.Reset();
+	CachedGrassTransforms.Reset();
+	CachedGrassWindPhases.Reset();
+	bCollisionCooked = false;
+	bCollisionApplied = false;
+	++CollisionUpdateSerial;
 	ClearAllGrassInstances();
-	if (ProceduralMesh)
+	if (RealtimeMesh)
 	{
-		ProceduralMesh->ClearAllMeshSections();
+		UBodySetup* BodyBeforeReset = RealtimeMesh->GetBodySetup();
+		RealtimeMesh->ClearCustomComplexMeshGeometry();
+		UBodySetup* BodyAfterClear = RealtimeMesh->GetBodySetup();
+		RealtimeMesh->Reset();
+		if (BodyBeforeReset)
+		{
+			BodyBeforeReset->InvalidatePhysicsData();
+			BodyBeforeReset->MarkAsGarbage();
+		}
+		if (BodyAfterClear && BodyAfterClear != BodyBeforeReset)
+		{
+			BodyAfterClear->InvalidatePhysicsData();
+			BodyAfterClear->MarkAsGarbage();
+		}
+	}
+	if (RealtimeMeshComponent)
+	{
+		RealtimeMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	}
 	if (IsValid(PCGComponent))
 	{
 		PCGComponent->CleanupLocalImmediate(/*bRemoveComponents=*/true);
 	}
 
-	CurrentLOD = ComputeTargetLOD(false);
+	AttachRealtimeMesh();
 	GenerateTerrainMesh();
 }
 
@@ -1122,10 +1238,107 @@ void ATerrainChunk::SetCollisionEnabled(bool bEnabled)
 
 	bServerCollisionEnabled = bEnabled;
 
-	if (bHasGeneratedMesh || bIsGenerating)
+	// The first visual build belongs to InitializeChunk. Starting one here as well uploads the LODs twice
+	// and is what republished sections when a pooled chunk crossed the collision radius.
+	if (!bHasGeneratedMesh)
+	{
+		return;
+	}
+
+	// The height grid is built once, the first time a dedicated chunk needs collision.
+	if (IsNetMode(NM_DedicatedServer) && bEnabled && !bCollisionCooked && CachedLOD0Grid.Num() == 0)
 	{
 		GenerateTerrainMesh();
+		return;
 	}
+
+	RefreshCollisionState();
+}
+
+float ATerrainChunk::DistSqFromLocalPawn() const
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return TNumericLimits<float>::Max();
+	}
+
+	const APawn* Pawn = nullptr;
+	if (const APlayerController* Controller = World->GetFirstPlayerController())
+	{
+		Pawn = Controller->GetPawn();
+	}
+	if (!Pawn && GEngine)
+	{
+		if (const APlayerController* Controller = GEngine->GetFirstLocalPlayerController(World))
+		{
+			Pawn = Controller->GetPawn();
+		}
+	}
+	if (!Pawn || InitData.Seed == 0)
+	{
+		return TNumericLimits<float>::Max();
+	}
+
+	const float PointX = Pawn->GetActorLocation().X / ChunkWorldSize;
+	const float PointY = Pawn->GetActorLocation().Y / ChunkWorldSize;
+	const float ChunkX = static_cast<float>(InitData.Coords.X);
+	const float ChunkY = static_cast<float>(InitData.Coords.Y);
+	const float DX = FMath::Max3(ChunkX - PointX, 0.0f, PointX - (ChunkX + 1.0f));
+	const float DY = FMath::Max3(ChunkY - PointY, 0.0f, PointY - (ChunkY + 1.0f));
+	return DX * DX + DY * DY;
+}
+
+bool ATerrainChunk::WantsDetail(bool bCurrentlyActive) const
+{
+	int32 RadiusChunks = 2;
+	if (const ATerrainManager* Manager = GetTerrainManager())
+	{
+		RadiusChunks = FMath::Max(Manager->GetCollisionRadiusInChunks(), 0);
+	}
+
+	// Stay active one chunk past the enable radius so walking a cell border does not rebuild grass and PCG.
+	const float Radius = static_cast<float>(bCurrentlyActive ? RadiusChunks + 1 : RadiusChunks);
+	return DistSqFromLocalPawn() <= Radius * Radius;
+}
+
+bool ATerrainChunk::NeedsDetailRefresh() const
+{
+	if (IsNetMode(NM_DedicatedServer) || InitData.Seed == 0 || IsHidden() || !bHasGeneratedMesh)
+	{
+		return false;
+	}
+
+	const bool bActive = bGrassBuilt || bPCGGenerated;
+	return bActive != WantsDetail(bActive);
+}
+
+void ATerrainChunk::RefreshDetailState()
+{
+	if (IsNetMode(NM_DedicatedServer) || InitData.Seed == 0 || IsHidden() || !bHasGeneratedMesh)
+	{
+		return;
+	}
+
+	const bool bActive = bGrassBuilt || bPCGGenerated;
+	if (WantsDetail(bActive))
+	{
+		ApplyGrassInstances();
+		GeneratePCG();
+	}
+	else if (bActive)
+	{
+		if (bGrassBuilt)
+		{
+			ReleaseGrassInstances();
+		}
+		ReleasePCG();
+	}
+}
+
+void ATerrainChunk::RefreshCollisionState()
+{
+	ApplyStoredCollision(ShouldHaveCollision());
 }
 
 bool ATerrainChunk::ShouldHaveCollision() const
@@ -1135,209 +1348,389 @@ bool ATerrainChunk::ShouldHaveCollision() const
 		return bServerCollisionEnabled;
 	}
 
-	// Same square test as ATerrainManager: distance in chunks from the pawn to this chunk's footprint.
-	// Visual LOD must not turn collision on; a forced fine mesh would otherwise cook every streamed chunk.
-	const UWorld* World = GetWorld();
-	const APlayerController* Controller = GEngine ? GEngine->GetFirstLocalPlayerController(World) : nullptr;
-	const APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
-	if (!World || !Pawn)
-	{
-		return false;
-	}
-
+	// Same square test as ATerrainManager. Visual LOD does not turn collision on.
 	int32 RadiusChunks = 2;
-	for (TActorIterator<ATerrainManager> It(World); It; ++It)
+	if (const ATerrainManager* Manager = GetTerrainManager())
 	{
-		RadiusChunks = FMath::Max(It->GetCollisionRadiusInChunks(), 0);
-		break;
+		RadiusChunks = FMath::Max(Manager->GetCollisionRadiusInChunks(), 0);
 	}
 
 	const float Radius = static_cast<float>(RadiusChunks);
-	const float PointX = static_cast<float>(Pawn->GetActorLocation().X) / ChunkWorldSize;
-	const float PointY = static_cast<float>(Pawn->GetActorLocation().Y) / ChunkWorldSize;
-	const float ChunkX = static_cast<float>(InitData.Coords.X);
-	const float ChunkY = static_cast<float>(InitData.Coords.Y);
-	const float DX = FMath::Max3(ChunkX - PointX, 0.0f, PointX - (ChunkX + 1.0f));
-	const float DY = FMath::Max3(ChunkY - PointY, 0.0f, PointY - (ChunkY + 1.0f));
-	return (DX * DX + DY * DY) <= (Radius * Radius);
+	return DistSqFromLocalPawn() <= Radius * Radius;
+}
+
+void ATerrainChunk::UpdateLocalProximity()
+{
+	if (InitData.Seed == 0 || IsHidden() || !bHasGeneratedMesh)
+	{
+		return;
+	}
+
+	RefreshCollisionState();
+	RefreshDetailState();
+}
+
+void ATerrainChunk::SetupMeshMaterials()
+{
+	if (!RealtimeMesh)
+	{
+		return;
+	}
+
+	RealtimeMesh->SetupMaterialSlot(0, TEXT("Terrain"), TerrainMaterial);
+	RealtimeMesh->SetupMaterialSlot(1, TEXT("Water"), WaterMaterial);
+}
+
+void ATerrainChunk::ConfigureVisualLODs()
+{
+	if (!RealtimeMesh)
+	{
+		return;
+	}
+
+	// LOD 0 draws while the chunk fills the view. LOD 1 covers the middle band.
+	// LOD2ScreenSize is the cull threshold: a chunk smaller than that on screen is not drawn.
+	RealtimeMesh->UpdateLODConfig(0, FRealtimeMeshLODConfig(1.0f));
+	const float ScreenSizes[] = { LOD1ScreenSize, LOD2ScreenSize };
+	for (int32 LOD = 1; LOD < NumLODs; ++LOD)
+	{
+		if (RealtimeMesh->GetLODs().Num() <= LOD)
+		{
+			RealtimeMesh->AddLOD(FRealtimeMeshLODConfig(ScreenSizes[LOD - 1]));
+		}
+		else
+		{
+			RealtimeMesh->UpdateLODConfig(LOD, FRealtimeMeshLODConfig(ScreenSizes[LOD - 1]));
+		}
+	}
+}
+
+void ATerrainChunk::UploadSectionGroup(int32 LODIndex, FName GroupName, RealtimeMesh::FRealtimeMeshStreamSet&& Streams, int32 MaterialSlot, bool bCastShadow)
+{
+	using namespace RealtimeMesh;
+
+	if (!RealtimeMesh)
+	{
+		return;
+	}
+
+	const FRealtimeMeshStream* Positions = Streams.Find(FRealtimeMeshStreams::Position);
+	if (!Positions || Positions->Num() <= 0)
+	{
+		return;
+	}
+
+	const FRealtimeMeshSectionGroupKey GroupKey = FRealtimeMeshSectionGroupKey::Create(LODIndex, GroupName);
+	// Static so a loaded chunk is drawn once and does not stay in the per-frame dynamic mesh queue.
+	// The proxy is created only after these sections exist, and the component settles to Stationary after that.
+	RealtimeMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams), FRealtimeMeshSectionGroupConfig(ERealtimeMeshSectionDrawType::Static));
+
+	FRealtimeMeshSectionConfig Config(MaterialSlot);
+	Config.bCastsShadow = bCastShadow;
+	Config.bIsVisible = true;
+	const FRealtimeMeshSectionKey SectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
+	RealtimeMesh->UpdateSectionConfig(SectionKey, Config, false);
+}
+
+void ATerrainChunk::ApplyChunkBounds(float SkirtDepth)
+{
+	if (!RealtimeMesh || CachedLOD0Grid.Num() == 0)
+	{
+		return;
+	}
+
+	float MinZ = TNumericLimits<float>::Max();
+	float MaxZ = TNumericLimits<float>::Lowest();
+	for (const FTerrainGridSample& Sample : CachedLOD0Grid)
+	{
+		MinZ = FMath::Min(MinZ, Sample.Height);
+		MaxZ = FMath::Max(MaxZ, Sample.Height);
+	}
+
+	// Sea water sits at Z = 0, which can be above a submerged bed. The skirt hangs below the perimeter.
+	const float Skirt = FMath::Max(SkirtDepth, 0.0f);
+	const FBox LocalBox(
+		FVector(0.0f, 0.0f, FMath::Min(MinZ, 0.0f) - Skirt),
+		FVector(ChunkWorldSize, ChunkWorldSize, FMath::Max(MaxZ, 0.0f)));
+	const FBoxSphereBounds LocalBounds(LocalBox);
+	RealtimeMesh->SetLocalBounds(LocalBounds);
+
+	if (!RealtimeMeshComponent)
+	{
+		return;
+	}
+
+	// The bounds broadcast can run before ComponentToWorld matches RelativeLocation and then
+	// publish the empty-mesh sphere at the origin. Write the grid box in world space directly.
+	RealtimeMeshComponent->bComputeBoundsOnceForGame = false;
+	RealtimeMeshComponent->bComputedBoundsOnceForGame = false;
+	RealtimeMeshComponent->UpdateComponentToWorld(EUpdateTransformFlags::None, ETeleportType::TeleportPhysics);
+	RealtimeMeshComponent->Bounds = LocalBounds.TransformBy(RealtimeMeshComponent->GetComponentTransform());
+	if (RealtimeMeshComponent->IsRegistered())
+	{
+		RealtimeMeshComponent->MarkRenderTransformDirty();
+	}
+}
+
+void ATerrainChunk::RefreshRenderedMesh()
+{
+	if (!RealtimeMeshComponent)
+	{
+		return;
+	}
+
+	RealtimeMeshComponent->bComputeBoundsOnceForGame = false;
+	RealtimeMeshComponent->bComputedBoundsOnceForGame = false;
+	RealtimeMeshComponent->UpdateComponentToWorld(EUpdateTransformFlags::None, ETeleportType::TeleportPhysics);
+
+	if (RealtimeMeshComponent->IsRegistered())
+	{
+		RealtimeMeshComponent->UpdateBounds();
+		RealtimeMeshComponent->MarkRenderTransformDirty();
+		if (bVisualLODsReady)
+		{
+			RealtimeMeshComponent->MarkRenderStateDirty();
+		}
+	}
+
+	// UpdateBounds reads the mesh bounds. Until those stick, the primitive keeps the 1 cm sphere
+	// computed at the origin, and every chunk is frustum-culled. The grid box is the cull volume.
+	if (CachedLOD0Grid.Num() > 0)
+	{
+		ApplyChunkBounds(ResolveGenerationSettings().SkirtDepth);
+	}
 }
 
 namespace
 {
-	ATerrainManager* FindTerrainManager(const UWorld* World);
+	/** Plugin name for one complex collision mesh. */
+	using FRealtimeMeshCollisionData = FRealtimeMeshCollisionMesh;
+
+	/**
+	 * Complex collision for one chunk, sampled at 2 m from the 65×65 LOD 0 grid (32×32 quads, 2048 triangles).
+	 * The checkerboard split matches the visual mesh. Skirts stay out of the physics mesh.
+	 */
+	bool BuildCollisionData(const TArray<FTerrainGridSample>& Grid, FRealtimeMeshCollisionData& OutMesh)
+	{
+		using namespace TerrainChunkPrivate;
+
+		constexpr int32 VertexStep = 2;
+		static_assert(ATerrainChunk::QuadsPerSide % VertexStep == 0, "Collision step must divide the LOD 0 grid.");
+
+		const int32 SourceSide = ATerrainChunk::QuadsPerSide + 1;
+		const int32 CollisionQuads = ATerrainChunk::QuadsPerSide / VertexStep;
+		const int32 CollisionSide = CollisionQuads + 1;
+		if (Grid.Num() != SourceSide * SourceSide)
+		{
+			return false;
+		}
+
+		TArray<FVector3f> Vertices;
+		Vertices.Reserve(CollisionSide * CollisionSide);
+		for (int32 Y = 0; Y < CollisionSide; ++Y)
+		{
+			const int32 SourceY = Y * VertexStep;
+			const float LocalY = static_cast<float>(SourceY) * ATerrainChunk::CellSize;
+			for (int32 X = 0; X < CollisionSide; ++X)
+			{
+				const int32 SourceX = X * VertexStep;
+				const float LocalX = static_cast<float>(SourceX) * ATerrainChunk::CellSize;
+				Vertices.Emplace(LocalX, LocalY, Grid[SourceX + (SourceY * SourceSide)].Height);
+			}
+		}
+
+		TArray<int32> Indices;
+		BuildTerrainTriangles(CollisionQuads, Indices);
+
+		TArray<RealtimeMesh::TIndex3<int32>> Triangles;
+		Triangles.Reserve(Indices.Num() / 3);
+		for (int32 TriangleIndex = 0; TriangleIndex < Indices.Num() / 3; ++TriangleIndex)
+		{
+			const int32 Base = TriangleIndex * 3;
+			Triangles.Emplace(Indices[Base], Indices[Base + 1], Indices[Base + 2]);
+		}
+
+		OutMesh = FRealtimeMeshCollisionData();
+		OutMesh.Name = TEXT("Terrain");
+		OutMesh.SetVertices(MoveTemp(Vertices));
+		OutMesh.SetTriangles(MoveTemp(Triangles));
+		return true;
+	}
 }
 
-void ATerrainChunk::UpdateVisualLOD()
+void ATerrainChunk::ApplyStoredCollision(bool bEnable)
 {
-	if (InitData.Seed == 0 || IsHidden())
+	if (!RealtimeMeshComponent || !RealtimeMesh)
 	{
 		return;
 	}
 
-	const int32 TargetLOD = ComputeTargetLOD(true);
-	const bool bCollisionChanged = !HasAuthority() && bHasGeneratedMesh && (ShouldHaveCollision() != bCollisionApplied);
-	if (TargetLOD == CurrentLOD && !bCollisionChanged)
+	if (!bEnable)
 	{
+		DisableStoredCollision();
 		return;
 	}
 
-	// Sections for every LOD are already on the proxy. A distance change only hides and shows them.
-	if (bVisualLODsReady && !bCollisionChanged)
+	if (!bCollisionCooked)
 	{
-		CurrentLOD = TargetLOD;
-		ApplyVisualLODVisibility(CurrentLOD);
-		if (CurrentLOD == 0 && !bGrassBuilt)
+		FRealtimeMeshCollisionData CollisionMesh;
+		if (!BuildCollisionData(CachedLOD0Grid, CollisionMesh))
 		{
-			GenerateTerrainMesh();
-		}
-		return;
-	}
-
-	// Entering or leaving the collision radius still uploads the hidden collision section.
-	if (bVisualLODsReady && bCollisionChanged)
-	{
-		if (TargetLOD != CurrentLOD)
-		{
-			CurrentLOD = TargetLOD;
-			ApplyVisualLODVisibility(CurrentLOD);
-		}
-		GenerateTerrainMesh();
-		return;
-	}
-
-	// Collision and the first mesh stay outside the budget. A refused visual rebuild must not write CurrentLOD:
-	// the next try would then see no difference and drop the mesh change.
-	if (!bCollisionChanged)
-	{
-		if (bIsGenerating)
-		{
-			DeferVisualLODRetry();
 			return;
 		}
 
-		ATerrainManager* Manager = FindTerrainManager(GetWorld());
-		if (Manager && !Manager->TryConsumeVisualLODRebuild(this))
+		const int32 TriangleCount = CollisionMesh.GetTriangles().Num();
+		FRealtimeMeshComplexGeometry Geometry;
+		Geometry.Add(MoveTemp(CollisionMesh));
+
+		FRealtimeMeshCollisionConfiguration Config;
+		// One triangle mesh, flagged so a pawn's simple sweep hits it. Per-quad convexes cooked for
+		// more than a second each and never reached the authoritative body.
+		Config.bUseAsyncCook = true;
+		Config.bUseComplexAsSimpleCollision = true;
+		RealtimeMesh->SetCollisionConfig(Config);
+
+		const uint32 Serial = ++CollisionUpdateSerial;
+		bCollisionCooked = true;
+		UE_LOG(LogTerrainChunk, Warning, TEXT("%s: cooking terrain collision, %d triangles."),
+			*GetName(), TriangleCount);
+
+		TWeakObjectPtr<ATerrainChunk> WeakThis(this);
+		RealtimeMesh->SetCustomComplexMeshGeometry(MoveTemp(Geometry)).Next([WeakThis, Serial](ERealtimeMeshCollisionUpdateResult Result)
 		{
-			DeferVisualLODRetry();
-			return;
-		}
+			auto ApplyBody = [WeakThis, Result, Serial]()
+			{
+				ATerrainChunk* Chunk = WeakThis.Get();
+				if (!Chunk || Chunk->CollisionUpdateSerial != Serial || !Chunk->bCollisionCooked
+					|| !Chunk->RealtimeMeshComponent || !Chunk->RealtimeMesh)
+				{
+					return;
+				}
 
-		bHoldsVisualLODSlot = Manager != nullptr;
+				URealtimeMeshComponent* MeshComponent = Chunk->RealtimeMeshComponent;
+				// The body setup lives on the mesh object. A server that never draws sections still has to
+				// point the component at it, or the pawn's authoritative sweep has no shape to hit.
+				// A chunk that already published its LODs keeps that pointer; this does not upload sections.
+				const bool bServerNeedsBody = Chunk->IsNetMode(NM_DedicatedServer);
+				if ((Chunk->bVisualLODsReady || bServerNeedsBody) && MeshComponent->GetRealtimeMesh() != Chunk->RealtimeMesh)
+				{
+					MeshComponent->SetRealtimeMesh(Chunk->RealtimeMesh);
+				}
+
+				Chunk->SettleChunkMobility();
+				MeshComponent->SetCollisionProfileName(TEXT("BlockAll"));
+				MeshComponent->SetCollisionObjectType(ECC_WorldStatic);
+				MeshComponent->SetCollisionResponseToAllChannels(ECR_Block);
+				MeshComponent->SetCollisionEnabled(Chunk->bCollisionApplied
+					? ECollisionEnabled::QueryAndPhysics
+					: ECollisionEnabled::NoCollision);
+
+				const UBodySetup* Body = MeshComponent->GetBodySetup();
+				const int32 TriMeshCount = Body ? Body->TriMeshGeometries.Num() : 0;
+				UE_LOG(LogTerrainChunk, Warning, TEXT("%s: collision cook result %d, physics %d, trimeshes %d."),
+					*Chunk->GetName(), static_cast<int32>(Result), MeshComponent->IsPhysicsStateCreated() ? 1 : 0, TriMeshCount);
+			};
+
+			// The cook future completes inside the mesh read lock. SetMobility reregisters the
+			// primitive and takes the write lock on the same thread, which asserts. Run after the lock drops.
+			AsyncTask(ENamedThreads::GameThread, ApplyBody);
+		});
 	}
-
-	CurrentLOD = TargetLOD;
-	GenerateTerrainMesh();
-
-	// The build did not start, or it finished synchronously and OnBuildComplete already returned the slot.
-	if (bHoldsVisualLODSlot && !bIsGenerating)
+	else if (RealtimeMeshComponent->GetCollisionEnabled() == ECollisionEnabled::NoCollision)
 	{
-		ReleaseVisualLODSlot();
+		SettleChunkMobility();
+		RealtimeMeshComponent->SetCollisionProfileName(TEXT("BlockAll"));
+		RealtimeMeshComponent->SetCollisionObjectType(ECC_WorldStatic);
+		RealtimeMeshComponent->SetCollisionResponseToAllChannels(ECR_Block);
+		RealtimeMeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	}
+
+	bCollisionApplied = true;
 }
 
-void ATerrainChunk::DeferVisualLODRetry()
+void ATerrainChunk::DisableStoredCollision()
 {
-	if (bVisualLODRetryScheduled && VisualLODRetryFrame == GFrameCounter)
+	if (!bCollisionApplied)
 	{
 		return;
 	}
 
-	UWorld* World = GetWorld();
-	if (!World)
+	// The cooked triangle mesh stays on the chunk. The next entry only flips collision back on.
+	// ResetChunkState is the path that drops the body, when the actor returns to the pool.
+	bCollisionApplied = false;
+	if (RealtimeMeshComponent)
+	{
+		RealtimeMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	}
+}
+
+void ATerrainChunk::DestroyMeshBodySetup()
+{
+	if (!RealtimeMesh)
 	{
 		return;
 	}
 
-	bVisualLODRetryScheduled = true;
-	VisualLODRetryFrame = GFrameCounter;
-	VisualLODRetryHandle = World->GetTimerManager().SetTimerForNextTick(this, &ATerrainChunk::UpdateVisualLOD);
-}
-
-void ATerrainChunk::ReleaseVisualLODSlot()
-{
-	if (!bHoldsVisualLODSlot)
+	UBodySetup* Body = RealtimeMesh->GetBodySetup();
+	if (!Body)
 	{
 		return;
 	}
 
-	bHoldsVisualLODSlot = false;
-	if (ATerrainManager* Manager = FindTerrainManager(GetWorld()))
+	Body->InvalidatePhysicsData();
+	if (FObjectProperty* BodyProperty = FindFProperty<FObjectProperty>(URealtimeMesh::StaticClass(), TEXT("BodySetup")))
 	{
-		Manager->ReleaseVisualLODRebuild(this);
+		BodyProperty->SetObjectPropertyValue_InContainer(RealtimeMesh, nullptr);
+	}
+	Body->MarkAsGarbage();
+
+	if (RealtimeMeshComponent && RealtimeMeshComponent->IsRegistered())
+	{
+		RealtimeMeshComponent->RecreatePhysicsState();
 	}
 }
 
-int32 ATerrainChunk::ComputeTargetLOD(bool bApplyHysteresis) const
+void ATerrainChunk::ReleaseGrassInstances()
 {
-	if (IsNetMode(NM_DedicatedServer))
+	for (const TPair<uint8, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>>& HISMPair : BiomeGrassHISMs)
 	{
-		return 0;
-	}
-
-	const APlayerController* LocalController = GEngine ? GEngine->GetFirstLocalPlayerController(GetWorld()) : nullptr;
-	if (!LocalController || !LocalController->PlayerCameraManager)
-	{
-		return CurrentLOD;
-	}
-
-	const FVector CameraLocation = LocalController->PlayerCameraManager->GetCameraLocation();
-
-	// Horizontal distance to the nearest point of the chunk square: the chunk under the camera is always at 0,
-	// so a tall mountain can not push it to a coarser LOD and switch off the client's collision.
-	const float ChunkSize = ChunkWorldSize;
-	const FVector ChunkOrigin = GetActorLocation();
-	const float MinX = static_cast<float>(ChunkOrigin.X);
-	const float MinY = static_cast<float>(ChunkOrigin.Y);
-	const float CameraX = static_cast<float>(CameraLocation.X);
-	const float CameraY = static_cast<float>(CameraLocation.Y);
-	const float DX = FMath::Max3(MinX - CameraX, 0.0f, CameraX - (MinX + ChunkSize));
-	const float DY = FMath::Max3(MinY - CameraY, 0.0f, CameraY - (MinY + ChunkSize));
-	const float Distance = FMath::Sqrt(DX * DX + DY * DY);
-
-	auto LODForDistance = [this](float InDistance)
-	{
-		if (InDistance <= LOD1Distance)
+		if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = HISMPair.Value.Get(); IsValid(GrassHISM))
 		{
-			return 0;
+			GrassHISM->ClearInstances();
+			GrassHISM->SetVisibility(false);
+			if (GrassHISM->IsRegistered())
+			{
+				GrassHISM->UnregisterComponent();
+			}
 		}
-		return InDistance <= LOD2Distance ? 1 : 2;
-	};
-
-	if (!bApplyHysteresis)
-	{
-		return LODForDistance(Distance);
 	}
 
-	const int32 CoarserLOD = LODForDistance(Distance - LODHysteresis);
-	if (CoarserLOD > CurrentLOD)
-	{
-		return CoarserLOD;
-	}
-
-	const int32 FinerLOD = LODForDistance(Distance);
-	return FinerLOD < CurrentLOD ? FinerLOD : CurrentLOD;
+	bGrassBuilt = false;
 }
 
-namespace
+void ATerrainChunk::SetTerrainManager(ATerrainManager* InManager)
 {
-	ATerrainManager* FindTerrainManager(const UWorld* World)
-	{
-		if (!World)
-		{
-			return nullptr;
-		}
+	CachedTerrainManager = InManager;
+}
 
-		for (TActorIterator<ATerrainManager> It(World); It; ++It)
-		{
-			return *It;
-		}
-		return nullptr;
+ATerrainManager* ATerrainChunk::GetTerrainManager() const
+{
+	if (ATerrainManager* Manager = CachedTerrainManager.Get())
+	{
+		return Manager;
 	}
+
+	ATerrainManager* OwnerManager = Cast<ATerrainManager>(GetOwner());
+	if (OwnerManager)
+	{
+		CachedTerrainManager = OwnerManager;
+	}
+	return OwnerManager;
 }
 
 FTerrainGenerationSettings ATerrainChunk::ResolveGenerationSettings() const
 {
-	if (const ATerrainManager* Manager = FindTerrainManager(GetWorld()))
+	if (const ATerrainManager* Manager = GetTerrainManager())
 	{
 		return Manager->GetGenerationSettings();
 	}
@@ -2707,7 +3100,7 @@ float FTerrainGenerator::ComputeHeight(float WorldX, float WorldY, TConstArrayVi
 	}
 
 	// No detail noise near sea level: it would break the waterline into grid-aligned steps.
-	// DetailScale is 1 on LOD 0. Coarse LODs pass CellSize / Step, faded back to 1 within 4 m of the chunk edge.
+	// The chunk grid is sampled once at DetailScale 1. Coarse LODs reuse those nodes.
 	DetailElevation *= DetailScale;
 	DetailElevation *= FMath::SmoothStep(0.0f, ShoreDetailFadeHeight, FMath::Abs(BaseElevation));
 
@@ -2719,109 +3112,63 @@ float FTerrainGenerator::GetTerrainDeltaHeight(float /*WorldX*/, float /*WorldY*
 	return 0.0f;
 }
 
-void FTerrainGenerator::BuildTerrainBuffers(int32 LOD, bool bWithSkirts, FTerrainMeshBuffers& OutBuffers) const
+void FTerrainGenerator::CacheSurfaceGrid()
 {
 	using namespace TerrainChunkPrivate;
 
-	const int32 ClampedLOD = FMath::Clamp(LOD, 0, NumLODs - 1);
-	const int32 QuadCount = QuadsPerSide >> ClampedLOD;
-	const int32 VerticesPerSide = QuadCount + 1;
-	const int32 VertexCount = VerticesPerSide * VerticesPerSide;
-	const float Step = CellSize * static_cast<float>(QuadsPerSide / QuadCount);
-
-	OutBuffers.QuadCount = QuadCount;
-	OutBuffers.Step = Step;
-
-	// Heights are cached with a one-cell border. LOD 0 reads it for CellSize normals.
-	// Coarser LODs sample their normals directly over CellSize so a shared edge matches the fine neighbour.
-	const int32 HeightsPerSide = VerticesPerSide + 2;
-	OutBuffers.HeightsPerSide = HeightsPerSide;
+	// LOD 0 is QuadsPerSide × QuadsPerSide quads (65×65 vertices). One extra cell on every side supplies the
+	// central-difference neighbours, so the sample is (QuadsPerSide + 3)².
+	const int32 Side = QuadsPerSide + 3;
+	SurfaceGrid.SetNum(Side * Side);
 
 	const float ChunkOriginX = static_cast<float>(InitData.Coords.X) * ChunkWorldSize;
 	const float ChunkOriginY = static_cast<float>(InitData.Coords.Y) * ChunkWorldSize;
 
-	TArray<float>& Heights = OutBuffers.Heights;
-	Heights.SetNumUninitialized(HeightsPerSide * HeightsPerSide);
-
-	// Packed biome pair per sample, in world space so it agrees with the neighbouring chunk along the seam.
 	TArray<FColor> BiomeColors;
-	BiomeColors.SetNumUninitialized(HeightsPerSide * HeightsPerSide);
+	BiomeColors.SetNumUninitialized(Side * Side);
 
-	for (int32 Y = 0; Y < HeightsPerSide; ++Y)
+	for (int32 Y = 0; Y < Side; ++Y)
 	{
-		const float LocalY = static_cast<float>(Y - 1) * Step;
-		const float WorldY = ChunkOriginY + LocalY;
-		for (int32 X = 0; X < HeightsPerSide; ++X)
+		const float WorldY = ChunkOriginY + static_cast<float>(Y - 1) * CellSize;
+		for (int32 X = 0; X < Side; ++X)
 		{
-			const float LocalX = static_cast<float>(X - 1) * Step;
-			const float WorldX = ChunkOriginX + LocalX;
-			const int32 Index = X + (Y * HeightsPerSide);
+			const float WorldX = ChunkOriginX + static_cast<float>(X - 1) * CellSize;
+			const int32 Index = X + (Y * Side);
 
-			// LOD 0 keeps the full surface. Coarser LODs damp detail inside the chunk and restore it
-			// across the outer 4 m, so a vertex shared with a finer neighbour has the same height.
-			float DetailScale = 1.0f;
-			if (ClampedLOD > 0)
-			{
-				const float EdgeDistance = FMath::Min(
-					FMath::Min(LocalX, ChunkWorldSize - LocalX),
-					FMath::Min(LocalY, ChunkWorldSize - LocalY));
-				const float InteriorScale = CellSize / Step;
-				const float EdgeBlend = FMath::SmoothStep(0.0f, 400.0f, EdgeDistance);
-				DetailScale = FMath::Lerp(1.0f, InteriorScale, EdgeBlend);
-			}
-
-			Heights[Index] = ComputeHeight(WorldX, WorldY, ChunkLakes, nullptr, &BiomeColors[Index], DetailScale);
+			EBiomeType StrictBiome = EBiomeType::Ocean;
+			FColor VertexColor = FColor::Black;
+			FTerrainGridSample& Sample = SurfaceGrid[Index];
+			Sample.Height = ComputeHeight(WorldX, WorldY, ChunkLakes, &StrictBiome, &VertexColor, 1.0f);
+			Sample.StrictBiome = static_cast<uint8>(StrictBiome);
+			Sample.VertexColor = VertexColor;
+			Sample.Normal = FVector::UpVector;
+			Sample.Tangent = FVector::ForwardVector;
+			BiomeColors[Index] = VertexColor;
 		}
 	}
 
-	// Pure nodes touching a border take that border's (R, G) with B pinned, before any triangle is built.
-	HarmonizeBiomePairColors(BiomeColors, HeightsPerSide);
+	// Pure nodes touching a border take that border's (R, G) with B pinned, before any mesh is built.
+	HarmonizeBiomePairColors(BiomeColors, Side);
 
-	auto HeightAt = [&Heights, HeightsPerSide](int32 X, int32 Y)
-	{
-		return CachedHeight(Heights, HeightsPerSide, X, Y);
-	};
-
-	BuildTerrainTriangles(QuadCount, OutBuffers.Triangles);
-
-	const int32 SkirtVertexCount = bWithSkirts ? QuadCount * 4 : 0;
-	OutBuffers.Vertices.Reset(VertexCount + SkirtVertexCount);
-	OutBuffers.Normals.Reset(VertexCount + SkirtVertexCount);
-	OutBuffers.UVs.Reset(VertexCount + SkirtVertexCount);
-	OutBuffers.Tangents.Reset(VertexCount + SkirtVertexCount);
-	OutBuffers.Colors.Reset(VertexCount + SkirtVertexCount);
-
-	// Every LOD differences the unfiltered surface over CellSize, so a vertex shared by two LODs gets the
-	// same normal. LOD 0 reads that spacing from the height cache. Coarser LODs sample ComputeHeight at
-	// ±CellSize with DetailScale 1, not the filtered grid and not the coarse Step.
 	const float NormalZ = (2.0f * CellSize) / FMath::Max(NormalStrength, 0.01f);
-	const float InvQuads = 1.0f / static_cast<float>(QuadCount);
-	const bool bGridNormal = FMath::IsNearlyEqual(Step, CellSize);
-
-	for (int32 Y = 0; Y < VerticesPerSide; ++Y)
+	for (int32 Y = 0; Y < Side; ++Y)
 	{
-		const float LocalY = static_cast<float>(Y) * Step;
-
-		for (int32 X = 0; X < VerticesPerSide; ++X)
+		for (int32 X = 0; X < Side; ++X)
 		{
-			const float LocalX = static_cast<float>(X) * Step;
+			const int32 Index = X + (Y * Side);
+			FTerrainGridSample& Sample = SurfaceGrid[Index];
+			Sample.VertexColor = BiomeColors[Index];
 
-			auto SampleNormalHeight = [&](float OffsetX, float OffsetY) -> float
+			// The border ring exists so the inner 65×65 can difference across ±CellSize. It is not a mesh vertex.
+			if (X == 0 || Y == 0 || X == Side - 1 || Y == Side - 1)
 			{
-				if (bGridNormal)
-				{
-					const int32 GridX = X + FMath::RoundToInt(OffsetX / Step);
-					const int32 GridY = Y + FMath::RoundToInt(OffsetY / Step);
-					return HeightAt(GridX, GridY);
-				}
+				continue;
+			}
 
-				return ComputeHeight(ChunkOriginX + LocalX + OffsetX, ChunkOriginY + LocalY + OffsetY, ChunkLakes, nullptr, nullptr);
-			};
-
-			const float HeightL = SampleNormalHeight(-CellSize, 0.0f);
-			const float HeightR = SampleNormalHeight(CellSize, 0.0f);
-			const float HeightD = SampleNormalHeight(0.0f, -CellSize);
-			const float HeightU = SampleNormalHeight(0.0f, CellSize);
+			const float HeightL = SurfaceGrid[(X - 1) + (Y * Side)].Height;
+			const float HeightR = SurfaceGrid[(X + 1) + (Y * Side)].Height;
+			const float HeightD = SurfaceGrid[X + ((Y - 1) * Side)].Height;
+			const float HeightU = SurfaceGrid[X + ((Y + 1) * Side)].Height;
 
 			// Central difference over ±CellSize. GetSafeNormal returns zero for a degenerate vector; the packed
 			// vertex format then stores that zero and directional light drops out, leaving only the skylight.
@@ -2839,26 +3186,103 @@ void FTerrainGenerator::BuildTerrainBuffers(int32 LOD, bool bWithSkirts, FTerrai
 				TangentX = FVector::VectorPlaneProject(FVector::RightVector, Normal).GetSafeNormal();
 			}
 
-			OutBuffers.Vertices.Add(FVector(LocalX, LocalY, HeightAt(X, Y)));
-			OutBuffers.Normals.Add(Normal);
-			OutBuffers.UVs.Add(FVector2D(static_cast<float>(X) * InvQuads, static_cast<float>(Y) * InvQuads));
-			OutBuffers.Tangents.Add(FProcMeshTangent(TangentX, false));
+			Sample.Normal = Normal;
+			Sample.Tangent = TangentX;
+		}
+	}
+}
 
-			OutBuffers.Colors.Add(BiomeColors[(X + 1) + ((Y + 1) * HeightsPerSide)]);
+void FTerrainGenerator::CopyInnerLOD0Grid(TArray<FTerrainGridSample>& OutGrid) const
+{
+	const int32 FullSide = QuadsPerSide + 3;
+	const int32 InnerSide = QuadsPerSide + 1;
+	OutGrid.SetNum(InnerSide * InnerSide);
+
+	for (int32 Y = 0; Y < InnerSide; ++Y)
+	{
+		for (int32 X = 0; X < InnerSide; ++X)
+		{
+			OutGrid[X + (Y * InnerSide)] = SurfaceGrid[(X + 1) + ((Y + 1) * FullSide)];
+		}
+	}
+}
+
+RealtimeMesh::FRealtimeMeshStreamSet FTerrainGenerator::BuildTerrainStreams(int32 LOD, bool bWithSkirts) const
+{
+	using namespace TerrainChunkPrivate;
+
+	RealtimeMesh::FRealtimeMeshStreamSet Streams;
+	const int32 ClampedLOD = FMath::Clamp(LOD, 0, NumLODs - 1);
+	const int32 QuadCount = QuadsPerSide >> ClampedLOD;
+	const int32 VerticesPerSide = QuadCount + 1;
+	const float Step = CellSize * static_cast<float>(1 << ClampedLOD);
+	const int32 Stride = 1 << ClampedLOD;
+	const int32 FullSide = QuadsPerSide + 3;
+	if (SurfaceGrid.Num() != FullSide * FullSide)
+	{
+		return Streams;
+	}
+
+	FTerrainStreamBuilder Builder(Streams);
+	Builder.EnableTangents<FPackedNormal>();
+	Builder.EnableTexCoords<FVector2f>();
+	Builder.EnableColors();
+
+	const int32 SkirtVertexCount = bWithSkirts ? QuadCount * 4 : 0;
+	Builder.ReserveNumVertices(VerticesPerSide * VerticesPerSide + SkirtVertexCount);
+	Builder.ReserveNumTriangles(QuadCount * QuadCount * 2 + (bWithSkirts ? QuadCount * 8 : 0));
+
+	// LOD 0 takes every interior node. LOD 1 takes every second, LOD 2 every fourth. Shared vertices are the
+	// same sample, so a coarse edge matches the fine neighbour without a second height pass.
+	const float InvQuads = 1.0f / static_cast<float>(QuadCount);
+	for (int32 Y = 0; Y < VerticesPerSide; ++Y)
+	{
+		const int32 GridY = 1 + (Y * Stride);
+		const float LocalY = static_cast<float>(Y) * Step;
+		for (int32 X = 0; X < VerticesPerSide; ++X)
+		{
+			const int32 GridX = 1 + (X * Stride);
+			const FTerrainGridSample& Sample = SurfaceGrid[GridX + (GridY * FullSide)];
+			const uint32 Index = Builder.AddVertex(FVector3f(static_cast<float>(X) * Step, LocalY, Sample.Height));
+			Builder.SetNormalAndTangent(Index, FVector3f(Sample.Normal), FVector3f(Sample.Tangent));
+			Builder.SetTexCoord(Index, 0, FVector2f(static_cast<float>(X) * InvQuads, static_cast<float>(Y) * InvQuads));
+			Builder.SetColor(Index, Sample.VertexColor);
+		}
+	}
+
+	for (int32 Y = 0; Y < QuadCount; ++Y)
+	{
+		for (int32 X = 0; X < QuadCount; ++X)
+		{
+			const uint32 BottomLeft = X + (Y * VerticesPerSide);
+			const uint32 BottomRight = BottomLeft + 1;
+			const uint32 TopLeft = BottomLeft + VerticesPerSide;
+			const uint32 TopRight = TopLeft + 1;
+			if (SplitQuadCheckerboard(X, Y))
+			{
+				Builder.AddTriangle(BottomLeft, TopLeft, TopRight);
+				Builder.AddTriangle(BottomLeft, TopRight, BottomRight);
+			}
+			else
+			{
+				Builder.AddTriangle(BottomLeft, TopLeft, BottomRight);
+				Builder.AddTriangle(BottomRight, TopLeft, TopRight);
+			}
 		}
 	}
 
 	if (bWithSkirts)
 	{
-		AppendSkirts(OutBuffers, SkirtDepth);
+		AppendSkirts(Builder, QuadCount, Step, SkirtDepth);
 	}
 
 	// A triangle that still has two pairs gets its own corner copies. Shared grid vertices stay shared only
 	// where every triangle that uses them agrees on (R, G).
-	SplitInconsistentBiomeTriangles(OutBuffers);
+	SplitInconsistentBiomeTriangles(Builder);
+	return Streams;
 }
 
-void FTerrainGenerator::BuildGrassTransforms(const FTerrainMeshBuffers& Lod0Terrain, TMap<uint8, TArray<FTransform>>& OutTransforms,
+void FTerrainGenerator::BuildGrassTransforms(const TArray<FTerrainGridSample>& Lod0Grid, TMap<uint8, TArray<FTransform>>& OutTransforms,
 	TMap<uint8, TArray<float>>& OutWindPhases) const
 {
 	using namespace TerrainChunkPrivate;
@@ -2866,7 +3290,8 @@ void FTerrainGenerator::BuildGrassTransforms(const FTerrainMeshBuffers& Lod0Terr
 	OutTransforms.Reset();
 	OutWindPhases.Reset();
 
-	if (GrassRules.Num() == 0 || Lod0Terrain.QuadCount <= 0)
+	const int32 VerticesPerSide = QuadsPerSide + 1;
+	if (GrassRules.Num() == 0 || Lod0Grid.Num() != VerticesPerSide * VerticesPerSide)
 	{
 		return;
 	}
@@ -2915,10 +3340,7 @@ void FTerrainGenerator::BuildGrassTransforms(const FTerrainMeshBuffers& Lod0Terr
 				uint8 SampleBiomeId = 0;
 				float SurfaceZ = 0.0f;
 				FVector SurfaceNormal = FVector::UpVector;
-				if (!SampleLod0Surface(Lod0Terrain, SampleLocalX, SampleLocalY, SampleBiomeId, SurfaceZ, SurfaceNormal))
-				{
-					continue;
-				}
+				SampleCachedLOD0Grid(Lod0Grid, VerticesPerSide, CellSize, SampleLocalX, SampleLocalY, SampleBiomeId, SurfaceZ, SurfaceNormal);
 				if (SampleBiomeId != Rule.BiomeId)
 				{
 					continue;
@@ -2969,57 +3391,31 @@ FTerrainBuildResult ATerrainChunk::CalculateTerrainData(FChunkInitData InInitDat
 	FTerrainGenerator Generator(Request.Settings, InInitData, InCellSize, InQuadsPerSide);
 	Generator.GrassRules = Request.GrassRules;
 
-	// Lakes are found once per build; the terrain grids and the water mesh all reuse them.
+	// Lakes once, then one 67×67 height pass. Every LOD, collision and grass read that grid.
 	Generator.CacheChunkLakes();
+	Generator.CacheSurfaceGrid();
 
 	FTerrainBuildResult Result;
+	Generator.CopyInnerLOD0Grid(Result.CachedLOD0Grid);
+
 	if (Request.bDedicatedServer)
 	{
-		// Dedicated server: collision mesh only, never grass.
-		Generator.BuildTerrainBuffers(0, false, Result.Terrain);
 		return Result;
 	}
 
 	if (Request.bBuildAllVisualLODs)
 	{
-		Result.TerrainLODs.SetNum(NumLODs);
-		Result.WaterLODs.SetNum(NumLODs);
+		Result.TerrainLODs.Reserve(NumLODs);
+		Result.WaterLODs.Reserve(NumLODs);
 		for (int32 LOD = 0; LOD < NumLODs; ++LOD)
 		{
-			Generator.BuildTerrainBuffers(LOD, true, Result.TerrainLODs[LOD]);
-			Generator.BuildWaterBuffers(Result.TerrainLODs[LOD], Result.WaterLODs[LOD]);
+			Result.TerrainLODs.Add(Generator.BuildTerrainStreams(LOD, true));
+			Result.WaterLODs.Add(Generator.BuildWaterStreams(LOD));
 		}
 
-		if (Request.bCollisionGrid)
-		{
-			Generator.BuildTerrainBuffers(0, false, Result.Collision);
-		}
-
-		// Grass reads the LOD 0 grid. The shown LOD may be coarser, in which case the request left grass off.
 		if (Request.bBuildGrass)
 		{
-			Generator.BuildGrassTransforms(Result.TerrainLODs[0], Result.GrassTransforms, Result.GrassWindPhases);
-		}
-
-		return Result;
-	}
-
-	if (Request.bUpdateCollisionOnly && Request.bCollisionGrid)
-	{
-		Generator.BuildTerrainBuffers(0, false, Result.Collision);
-	}
-
-	if (Request.bBuildGrass)
-	{
-		// The collision grid is the same LOD 0 surface grass samples. Build it only when collision did not.
-		if (Result.Collision.QuadCount <= 0)
-		{
-			Generator.BuildTerrainBuffers(0, false, Result.Terrain);
-			Generator.BuildGrassTransforms(Result.Terrain, Result.GrassTransforms, Result.GrassWindPhases);
-		}
-		else
-		{
-			Generator.BuildGrassTransforms(Result.Collision, Result.GrassTransforms, Result.GrassWindPhases);
+			Generator.BuildGrassTransforms(Result.CachedLOD0Grid, Result.GrassTransforms, Result.GrassWindPhases);
 		}
 	}
 
@@ -3028,7 +3424,7 @@ FTerrainBuildResult ATerrainChunk::CalculateTerrainData(FChunkInitData InInitDat
 
 void ATerrainChunk::GenerateTerrainMesh()
 {
-	if (!ProceduralMesh || InitData.Seed == 0 || IsHidden())
+	if (!RealtimeMeshComponent || InitData.Seed == 0 || IsHidden())
 	{
 		return;
 	}
@@ -3039,13 +3435,29 @@ void ATerrainChunk::GenerateTerrainMesh()
 		return;
 	}
 
-	const bool bWantsCollision = ShouldHaveCollision();
 	const bool bDedicatedServer = IsNetMode(NM_DedicatedServer);
+	const bool bDedicatedNeedsGrid = bDedicatedServer && ShouldHaveCollision() && !bCollisionCooked && CachedLOD0Grid.Num() == 0;
 
-	if (bDedicatedServer && !bWantsCollision)
+	// The visual mesh and the height grid are built once. Radius changes only toggle collision and detail.
+	if (bHasGeneratedMesh && !bDedicatedNeedsGrid)
 	{
-		// Nothing is rendered here: geometry exists only to carry collision, and only while it is enabled.
-		ProceduralMesh->ClearAllMeshSections();
+		RefreshCollisionState();
+		if (NeedsDetailRefresh())
+		{
+			if (ATerrainManager* Manager = GetTerrainManager())
+			{
+				Manager->EnqueueDetailRefresh(this);
+			}
+			else
+			{
+				RefreshDetailState();
+			}
+		}
+		return;
+	}
+
+	if (bDedicatedServer && !ShouldHaveCollision())
+	{
 		bHasGeneratedMesh = true;
 		return;
 	}
@@ -3053,44 +3465,14 @@ void ATerrainChunk::GenerateTerrainMesh()
 	FTerrainBuildRequest Request;
 	Request.Settings = ResolveGenerationSettings();
 	ResolvedGrass.Reset();
-	if (const ATerrainManager* Manager = FindTerrainManager(GetWorld()))
+	if (const ATerrainManager* Manager = GetTerrainManager())
 	{
 		ResolvedGrass = Manager->GetGrassEntries();
 	}
 	Request.bDedicatedServer = bDedicatedServer;
-	Request.LOD = bDedicatedServer ? 0 : CurrentLOD;
+	Request.bBuildAllVisualLODs = !bDedicatedServer;
 
-	if (bDedicatedServer)
-	{
-		Request.bTerrainCollision = true;
-		Request.bCollisionGrid = false;
-	}
-	else if (!bVisualLODsReady)
-	{
-		// One upload carries every visual LOD. Collision stays on its own hidden section, so a later LOD
-		// change does not have to recreate the proxy to retarget physics.
-		Request.bBuildAllVisualLODs = true;
-		Request.bTerrainCollision = false;
-		Request.bCollisionGrid = bWantsCollision;
-	}
-	else
-	{
-		Request.bUpdateCollisionOnly = bWantsCollision != bCollisionApplied;
-		Request.bTerrainCollision = false;
-		Request.bCollisionGrid = bWantsCollision;
-		if (!Request.bUpdateCollisionOnly && CurrentLOD != 0)
-		{
-			return;
-		}
-	}
-
-	// Mesh pointers stay on the actor; the worker only gets numeric placement rules.
-	// Grass: only while LOD 0 is showing, only once per InitData, never on a dedicated server.
 	PopulateGrassRequest(Request);
-	if (bVisualLODsReady && !Request.bUpdateCollisionOnly && !Request.bBuildGrass)
-	{
-		return;
-	}
 
 	bIsGenerating = true;
 	bRegenerationPending = false;
@@ -3102,36 +3484,27 @@ void ATerrainChunk::GenerateTerrainMesh()
 
 	if (LocalInitData.bForceSynchronous && !bHasGeneratedMesh)
 	{
-		const FTerrainBuildResult Result = CalculateTerrainData(LocalInitData, LocalCellSize, LocalQuads, Request);
+		FTerrainBuildResult Result = CalculateTerrainData(LocalInitData, LocalCellSize, LocalQuads, Request);
 		OnBuildComplete(Request, Result, LocalSerial);
 		return;
 	}
 
 	TWeakObjectPtr<ATerrainChunk> WeakThis(this);
-	TWeakObjectPtr<ATerrainManager> WeakManager = FindTerrainManager(GetWorld());
-	const bool bReleaseSlotIfOrphaned = bHoldsVisualLODSlot;
-	Async(EAsyncExecution::ThreadPool, [WeakThis, WeakManager, bReleaseSlotIfOrphaned, LocalInitData, LocalCellSize, LocalQuads, LocalSerial, Request = MoveTemp(Request)]() mutable
+	Async(EAsyncExecution::ThreadPool, [WeakThis, LocalInitData, LocalCellSize, LocalQuads, LocalSerial, Request = MoveTemp(Request)]() mutable
 	{
 		FTerrainBuildResult Result = CalculateTerrainData(LocalInitData, LocalCellSize, LocalQuads, Request);
 
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, WeakManager, bReleaseSlotIfOrphaned, LocalSerial, Request = MoveTemp(Request), Result = MoveTemp(Result)]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, LocalSerial, Request = MoveTemp(Request), Result = MoveTemp(Result)]() mutable
 		{
 			if (ATerrainChunk* Chunk = WeakThis.Get())
 			{
 				Chunk->OnBuildComplete(Request, Result, LocalSerial);
 			}
-			else if (bReleaseSlotIfOrphaned)
-			{
-				if (ATerrainManager* Manager = WeakManager.Get())
-				{
-					Manager->ReleaseVisualLODRebuild(nullptr);
-				}
-			}
 		});
 	});
 }
 
-void ATerrainChunk::OnBuildComplete(const FTerrainBuildRequest& Request, const FTerrainBuildResult& Result, uint32 Serial)
+void ATerrainChunk::OnBuildComplete(const FTerrainBuildRequest& Request, FTerrainBuildResult& Result, uint32 Serial)
 {
 	bIsGenerating = false;
 
@@ -3146,19 +3519,12 @@ void ATerrainChunk::OnBuildComplete(const FTerrainBuildRequest& Request, const F
 		bRegenerationPending = false;
 		GenerateTerrainMesh();
 	}
-
-	// Keep the slot through a chained rebuild so its upload cannot land beside another chunk's.
-	if (bHoldsVisualLODSlot && !bIsGenerating)
-	{
-		ReleaseVisualLODSlot();
-	}
 }
-
 void ATerrainChunk::PopulateGrassRequest(FTerrainBuildRequest& Request) const
 {
 	Request.bBuildGrass = false;
 	Request.GrassRules.Reset();
-	if (Request.bDedicatedServer || IsNetMode(NM_DedicatedServer) || bGrassBuilt || CurrentLOD != 0)
+	if (Request.bDedicatedServer || IsNetMode(NM_DedicatedServer) || bGrassCacheReady)
 	{
 		return;
 	}
@@ -3188,254 +3554,199 @@ void ATerrainChunk::PopulateGrassRequest(FTerrainBuildRequest& Request) const
 	Request.bBuildGrass = Request.GrassRules.Num() > 0;
 }
 
-void ATerrainChunk::ApplyVisualLODVisibility(int32 LOD)
+void ATerrainChunk::ApplyGrassInstances()
 {
-	if (!ProceduralMesh)
+	if (IsNetMode(NM_DedicatedServer) || bGrassBuilt || !bGrassCacheReady)
 	{
 		return;
 	}
 
-	const int32 ShownLOD = FMath::Clamp(LOD, 0, NumLODs - 1);
-	for (int32 Index = 0; Index < NumLODs; ++Index)
+	for (const TPair<uint8, TArray<FTransform>>& Pair : CachedGrassTransforms)
 	{
-		const bool bShow = Index == ShownLOD;
-		ProceduralMesh->SetMeshSectionVisible(TerrainSectionIndexForLOD(Index), bShow);
-
-		const int32 WaterIndex = WaterSectionIndexForLOD(Index);
-		const FProcMeshSection* WaterSection = ProceduralMesh->GetProcMeshSection(WaterIndex);
-		const bool bHasWater = WaterSection && WaterSection->ProcVertexBuffer.Num() > 0;
-		ProceduralMesh->SetMeshSectionVisible(WaterIndex, bShow && bHasWater);
-	}
-
-	ProceduralMesh->SetMeshSectionVisible(CollisionSectionIndex, false);
-}
-
-void ATerrainChunk::ApplyCollisionSection(const FTerrainMeshBuffers& Collision, bool bEnable)
-{
-	if (!ProceduralMesh)
-	{
-		return;
-	}
-
-	if (bEnable && Collision.Triangles.Num() > 0)
-	{
-		ProceduralMesh->CreateMeshSection(CollisionSectionIndex, Collision.Vertices, Collision.Triangles, Collision.Normals,
-			Collision.UVs, Collision.Colors, Collision.Tangents, true);
-		ProceduralMesh->SetMeshSectionVisible(CollisionSectionIndex, false);
-		bCollisionApplied = true;
-	}
-	else
-	{
-		ProceduralMesh->ClearMeshSection(CollisionSectionIndex);
-		bCollisionApplied = false;
-	}
-}
-
-void ATerrainChunk::ApplyGrassInstances(const FTerrainBuildResult& Result)
-{
-	if (IsNetMode(NM_DedicatedServer))
-	{
-		return;
-	}
-
-	EnsureGrassComponents();
-	ClearAllGrassInstances();
-
-	for (const TPair<uint8, TArray<FTransform>>& Pair : Result.GrassTransforms)
-	{
-		if (TObjectPtr<UHierarchicalInstancedStaticMeshComponent>* Found = BiomeGrassHISMs.Find(Pair.Key))
+		if (Pair.Value.Num() <= 0)
 		{
-			if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = Found->Get())
-			{
-				if (Pair.Value.Num() <= 0)
-				{
-					continue;
-				}
-
-				if (!GrassHISM->IsRegistered())
-				{
-					GrassHISM->RegisterComponent();
-				}
-
-				GrassHISM->AddInstances(Pair.Value, /*bShouldReturnIndices=*/false);
-
-				// Custom data 0 = wind phase, 1 = reserved flatten/interaction strength.
-				if (const TArray<float>* WindPhases = Result.GrassWindPhases.Find(Pair.Key))
-				{
-					const int32 Count = FMath::Min(Pair.Value.Num(), WindPhases->Num());
-					for (int32 InstanceIndex = 0; InstanceIndex < Count; ++InstanceIndex)
-					{
-						GrassHISM->SetCustomDataValue(InstanceIndex, 0, (*WindPhases)[InstanceIndex], false);
-						GrassHISM->SetCustomDataValue(InstanceIndex, 1, 0.0f, false);
-					}
-					GrassHISM->MarkRenderStateDirty();
-				}
-			}
+			continue;
 		}
-	}
 
-	for (const TPair<uint8, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>>& HISMPair : BiomeGrassHISMs)
-	{
-		if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = HISMPair.Value.Get(); IsValid(GrassHISM))
+		UHierarchicalInstancedStaticMeshComponent* GrassHISM = EnsureGrassComponent(Pair.Key);
+		if (!GrassHISM)
 		{
-			if (GrassHISM->GetInstanceCount() == 0 && GrassHISM->IsRegistered())
+			continue;
+		}
+
+		GrassHISM->SetVisibility(true);
+		if (!GrassHISM->IsRegistered())
+		{
+			GrassHISM->RegisterComponent();
+		}
+
+		GrassHISM->ClearInstances();
+		GrassHISM->AddInstances(Pair.Value, /*bShouldReturnIndices=*/false);
+
+		// Custom data 0 = wind phase, 1 = reserved flatten/interaction strength.
+		if (const TArray<float>* WindPhases = CachedGrassWindPhases.Find(Pair.Key))
+		{
+			const int32 Count = FMath::Min(Pair.Value.Num(), WindPhases->Num());
+			for (int32 InstanceIndex = 0; InstanceIndex < Count; ++InstanceIndex)
 			{
-				GrassHISM->UnregisterComponent();
+				GrassHISM->SetCustomDataValue(InstanceIndex, 0, (*WindPhases)[InstanceIndex], false);
+				GrassHISM->SetCustomDataValue(InstanceIndex, 1, 0.0f, false);
 			}
+			GrassHISM->MarkRenderStateDirty();
 		}
 	}
 
 	bGrassBuilt = true;
 }
 
-void ATerrainChunk::ApplyMesh(const FTerrainBuildRequest& Request, const FTerrainBuildResult& Result)
+void ATerrainChunk::ApplyMesh(const FTerrainBuildRequest& Request, FTerrainBuildResult& Result)
 {
-	if (!ProceduralMesh)
+	AttachRealtimeMesh();
+	if (!RealtimeMeshComponent || !RealtimeMesh)
 	{
 		return;
 	}
 
-	// Location is already final. Upload the mesh onto a stationary primitive so the proxy is not born dynamic.
-	SettleChunkMobility();
-
-	if (!Request.bDedicatedServer && !Request.bBuildAllVisualLODs)
+	if (Result.CachedLOD0Grid.Num() > 0)
 	{
-		if (Request.bUpdateCollisionOnly)
-		{
-			ApplyCollisionSection(Result.Collision, Request.bCollisionGrid);
-		}
-
-		if (Request.bBuildGrass)
-		{
-			ApplyGrassInstances(Result);
-		}
-
-		bHasGeneratedMesh = true;
-		return;
+		CachedLOD0Grid = MoveTemp(Result.CachedLOD0Grid);
 	}
 
-	const FTerrainMeshBuffers& Terrain = Result.Terrain;
-
-	// Drop every previous section before writing the new surface. CreateMeshSection only replaces its own index.
-	ProceduralMesh->ClearAllMeshSections();
-
-	if (Request.bDedicatedServer)
+	if (Request.bBuildGrass)
 	{
-		ProceduralMesh->CreateMeshSection(0, Terrain.Vertices, Terrain.Triangles, Terrain.Normals,
-			Terrain.UVs, Terrain.Colors, Terrain.Tangents, true);
-		bCollisionApplied = true;
+		CachedGrassTransforms = MoveTemp(Result.GrassTransforms);
+		CachedGrassWindPhases = MoveTemp(Result.GrassWindPhases);
+		bGrassCacheReady = true;
 	}
-	else
+	else if (Request.bBuildAllVisualLODs)
 	{
+		// First client build with no grass rules. The empty cache is the answer for this InitData.
+		CachedGrassTransforms.Reset();
+		CachedGrassWindPhases.Reset();
+		bGrassCacheReady = true;
+	}
+
+	const bool bVisualsCurrent = bVisualLODsReady
+		&& UploadedVisualSeed == InitData.Seed
+		&& UploadedVisualCoords == InitData.Coords;
+	if (!Request.bDedicatedServer && !bVisualsCurrent)
+	{
+		UBodySetup* BodyBeforeReset = RealtimeMesh->GetBodySetup();
+		RealtimeMesh->ClearCustomComplexMeshGeometry();
+		UBodySetup* BodyAfterClear = RealtimeMesh->GetBodySetup();
+		RealtimeMesh->Reset();
+		if (BodyBeforeReset)
+		{
+			BodyBeforeReset->InvalidatePhysicsData();
+			BodyBeforeReset->MarkAsGarbage();
+		}
+		if (BodyAfterClear && BodyAfterClear != BodyBeforeReset)
+		{
+			BodyAfterClear->InvalidatePhysicsData();
+			BodyAfterClear->MarkAsGarbage();
+		}
+		bCollisionCooked = false;
+		bCollisionApplied = false;
+		++CollisionUpdateSerial;
+		SetupMeshMaterials();
+		ConfigureVisualLODs();
+
 		for (int32 LOD = 0; LOD < Result.TerrainLODs.Num(); ++LOD)
 		{
-			const FTerrainMeshBuffers& LODTerrain = Result.TerrainLODs[LOD];
-			const int32 TerrainIndex = TerrainSectionIndexForLOD(LOD);
-			ProceduralMesh->CreateMeshSection(TerrainIndex, LODTerrain.Vertices, LODTerrain.Triangles, LODTerrain.Normals,
-				LODTerrain.UVs, LODTerrain.Colors, LODTerrain.Tangents, false);
-			ProceduralMesh->SetMaterial(TerrainIndex, TerrainMaterial);
-
-			if (Result.WaterLODs.IsValidIndex(LOD) && Result.WaterLODs[LOD].Triangles.Num() > 0)
+			// Static lighting is off, so only a dynamic caster draws a shadow. LOD 2 and water stay out of that pass.
+			const bool bTerrainShadow = LOD < NumLODs - 1;
+			UploadSectionGroup(LOD, TEXT("Terrain"), MoveTemp(Result.TerrainLODs[LOD]), 0, bTerrainShadow);
+			if (Result.WaterLODs.IsValidIndex(LOD))
 			{
-				const FTerrainMeshBuffers& Water = Result.WaterLODs[LOD];
-				const int32 WaterIndex = WaterSectionIndexForLOD(LOD);
-				ProceduralMesh->CreateMeshSection(WaterIndex, Water.Vertices, Water.Triangles, Water.Normals,
-					Water.UVs, Water.Colors, Water.Tangents, false);
-				ProceduralMesh->SetMaterial(WaterIndex, WaterMaterial);
+				UploadSectionGroup(LOD, TEXT("Water"), MoveTemp(Result.WaterLODs[LOD]), 1, false);
 			}
 		}
 
-		ApplyCollisionSection(Result.Collision, Request.bCollisionGrid);
-		// CurrentLOD may have moved while this build was on the worker. Every LOD is in the mesh, so show that one.
-		ApplyVisualLODVisibility(CurrentLOD);
 		bVisualLODsReady = true;
+		UploadedVisualSeed = InitData.Seed;
+		UploadedVisualCoords = InitData.Coords;
+		RealtimeMeshComponent->SetCastShadow(true);
+		RealtimeMeshComponent->bCastDynamicShadow = true;
+		RealtimeMeshComponent->bCastStaticShadow = true;
+		RealtimeMeshComponent->bAffectDistanceFieldLighting = false;
+		// The component stays mesh-less until here, so registration cannot build an empty scene proxy.
+		AttachRealtimeMesh();
+		UE_LOG(LogTerrainChunk, Warning, TEXT("%s: uploaded %d terrain LOD(s) at (%d, %d)."),
+			*GetName(), Result.TerrainLODs.Num(), InitData.Coords.X, InitData.Coords.Y);
 	}
 
-	// CreateMeshSection updates bounds per section. Refresh once after the whole surface so shadow culling sees the chunk.
-	ProceduralMesh->SetCastShadow(true);
-	ProceduralMesh->bCastDynamicShadow = true;
-	ProceduralMesh->UpdateBounds();
-	ProceduralMesh->MarkRenderStateDirty();
-	ProceduralMesh->MarkRenderTransformDirty();
+	ApplyChunkBounds(Request.Settings.SkirtDepth);
+	if (!Request.bDedicatedServer)
+	{
+		RefreshRenderedMesh();
+	}
 
 	bHasGeneratedMesh = true;
-
-	// Independent of terrain LOD: only builds that asked for grass refill the HISMs; others leave them alone.
-	if (Request.bBuildGrass && !Request.bDedicatedServer)
+	RefreshCollisionState();
+	if (NeedsDetailRefresh())
 	{
-		ApplyGrassInstances(Result);
+		if (ATerrainManager* Manager = GetTerrainManager())
+		{
+			Manager->EnqueueDetailRefresh(this);
+		}
+		else
+		{
+			RefreshDetailState();
+		}
 	}
-
-	// The build started at a coarse LOD and the camera has since reached LOD 0. Grass was not in this result.
-	if (bVisualLODsReady && CurrentLOD == 0 && !bGrassBuilt)
-	{
-		bRegenerationPending = true;
-	}
-
-	GeneratePCG();
 }
 
-void ATerrainChunk::EnsureGrassComponents()
+UHierarchicalInstancedStaticMeshComponent* ATerrainChunk::EnsureGrassComponent(uint8 BiomeId)
 {
 	if (IsNetMode(NM_DedicatedServer))
 	{
-		return;
+		return nullptr;
 	}
 
-	for (const FBiomeGrassEntry& Entry : ResolvedGrass)
+	const FBiomeGrassEntry* Entry = ResolvedGrass.FindByPredicate([BiomeId](const FBiomeGrassEntry& Candidate)
 	{
-		if (!Entry.Mesh || Entry.BiomeId == static_cast<uint8>(EBiomeType::Ocean))
-		{
-			continue;
-		}
-
-		const int32 CullStart = FMath::Max(0, Entry.CullDistanceStart);
-		const int32 CullEnd = FMath::Max(CullStart, Entry.CullDistanceEnd);
-
-		if (TObjectPtr<UHierarchicalInstancedStaticMeshComponent>* Existing = BiomeGrassHISMs.Find(Entry.BiomeId))
-		{
-			if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = Existing->Get())
-			{
-				GrassHISM->SetCullDistances(CullStart, CullEnd);
-				GrassHISM->NumCustomDataFloats = 2;
-				continue;
-			}
-		}
-
-		const FName CompName = *FString::Printf(TEXT("GrassHISM_%u"), Entry.BiomeId);
-		UHierarchicalInstancedStaticMeshComponent* GrassHISM = FindObject<UHierarchicalInstancedStaticMeshComponent>(this, *CompName.ToString());
-		if (!GrassHISM)
-		{
-			GrassHISM = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, CompName);
-			// Stationary while the chunk rests. PrepareChunkForTeleport pushes this to Movable with the root, and Settle puts it back.
-			GrassHISM->SetMobility(EComponentMobility::Stationary);
-			GrassHISM->SetupAttachment(GetRootComponent());
-			GrassHISM->SetStaticMesh(Entry.Mesh);
-			GrassHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-			GrassHISM->SetGenerateOverlapEvents(false);
-			GrassHISM->SetCanEverAffectNavigation(false);
-			GrassHISM->SetCastShadow(false);
-			GrassHISM->bAffectDynamicIndirectLighting = false;
-			GrassHISM->bAffectDistanceFieldLighting = false;
-			GrassHISM->SetReceivesDecals(false);
-			GrassHISM->NumCustomDataFloats = 2;
-		}
-
-		GrassHISM->SetCullDistances(CullStart, CullEnd);
-		BiomeGrassHISMs.Add(Entry.BiomeId, GrassHISM);
+		return Candidate.BiomeId == BiomeId && Candidate.Mesh && Candidate.BiomeId != static_cast<uint8>(EBiomeType::Ocean);
+	});
+	if (!Entry)
+	{
+		return nullptr;
 	}
+
+	const int32 CullStart = FMath::Max(0, Entry->CullDistanceStart);
+	const int32 CullEnd = FMath::Max(CullStart, Entry->CullDistanceEnd);
+
+	if (TObjectPtr<UHierarchicalInstancedStaticMeshComponent>* Existing = BiomeGrassHISMs.Find(BiomeId))
+	{
+		if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = Existing->Get(); IsValid(GrassHISM))
+		{
+			GrassHISM->SetCullDistances(CullStart, CullEnd);
+			GrassHISM->NumCustomDataFloats = 2;
+			return GrassHISM;
+		}
+	}
+
+	const FName CompName = MakeUniqueObjectName(this, UHierarchicalInstancedStaticMeshComponent::StaticClass(), TEXT("GrassHISM"));
+	UHierarchicalInstancedStaticMeshComponent* GrassHISM = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, CompName);
+	// Stationary while the chunk rests. PrepareChunkForTeleport pushes this to Movable with the root, and Settle puts it back.
+	GrassHISM->SetMobility(EComponentMobility::Stationary);
+	GrassHISM->SetupAttachment(GetRootComponent());
+	GrassHISM->SetStaticMesh(Entry->Mesh);
+	GrassHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	GrassHISM->SetGenerateOverlapEvents(false);
+	GrassHISM->SetCanEverAffectNavigation(false);
+	GrassHISM->SetCastShadow(false);
+	GrassHISM->bAffectDynamicIndirectLighting = false;
+	GrassHISM->bAffectDistanceFieldLighting = false;
+	GrassHISM->SetReceivesDecals(false);
+	GrassHISM->NumCustomDataFloats = 2;
+	GrassHISM->SetCullDistances(CullStart, CullEnd);
+	BiomeGrassHISMs.Add(BiomeId, GrassHISM);
+	return GrassHISM;
 }
 
 void ATerrainChunk::ClearAllGrassInstances()
 {
-	for (const TPair<uint8, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>>& HISMPair : BiomeGrassHISMs)
-	{
-		if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = HISMPair.Value.Get())
-		{
-			GrassHISM->ClearInstances();
-		}
-	}
-	bGrassBuilt = false;
+	ReleaseGrassInstances();
 }
 
 void ATerrainChunk::RemoveGrassInRadius(FVector /*Location*/, float /*Radius*/)
@@ -3449,39 +3760,63 @@ void ATerrainChunk::RemoveGrassInRadius(FVector /*Location*/, float /*Radius*/)
 
 void ATerrainChunk::GeneratePCG()
 {
-	if (bPCGGenerated || !PCGComponent || !ProceduralMesh || ProceduralMesh->GetNumSections() == 0)
+	if (bPCGGenerated || !PCGComponent || CachedLOD0Grid.Num() == 0)
 	{
 		return;
 	}
 
 	// Local, not networked: every machine builds the same terrain from InitData, so each scatters the same
-	// deterministic result itself instead of the server multicasting it. Once per InitData, since LOD rebuilds
-	// change only the mesh resolution. Immediate cleanup drops anything a previous pooled life left behind.
+	// deterministic result itself. Only while this chunk is inside the collision radius. Leaving that
+	// radius releases the graph, and the next visit builds it again.
 	PCGComponent->CleanupLocalImmediate(/*bRemoveComponents=*/true);
 	PCGComponent->bActivated = true;
 	PCGComponent->GenerateLocal(/*bForce=*/true);
 	bPCGGenerated = true;
 }
 
-void FTerrainGenerator::BuildWaterBuffers(const FTerrainMeshBuffers& Terrain, FTerrainMeshBuffers& OutWater) const
+void ATerrainChunk::ReleasePCG()
 {
-	using namespace TerrainChunkPrivate;
-
-	const TArray<float>& Heights = Terrain.Heights;
-	const int32 HeightsPerSide = Terrain.HeightsPerSide;
-	const int32 QuadCount = Terrain.QuadCount;
-	const int32 VerticesPerSide = QuadCount + 1;
-	const int32 VertexCount = VerticesPerSide * VerticesPerSide;
-	const float Step = Terrain.Step;
-
-	OutWater = FTerrainMeshBuffers();
-	OutWater.QuadCount = QuadCount;
-	OutWater.Step = Step;
-
-	if (QuadCount <= 0 || Heights.Num() < HeightsPerSide * HeightsPerSide)
+	if (!bPCGGenerated)
 	{
 		return;
 	}
+
+	bPCGGenerated = false;
+	if (IsValid(PCGComponent))
+	{
+		PCGComponent->CleanupLocalImmediate(/*bRemoveComponents=*/true);
+		PCGComponent->bActivated = false;
+	}
+}
+
+RealtimeMesh::FRealtimeMeshStreamSet FTerrainGenerator::BuildWaterStreams(int32 LOD) const
+{
+	using namespace TerrainChunkPrivate;
+
+	RealtimeMesh::FRealtimeMeshStreamSet Streams;
+	const int32 ClampedLOD = FMath::Clamp(LOD, 0, NumLODs - 1);
+	const int32 QuadCount = QuadsPerSide >> ClampedLOD;
+	const int32 VerticesPerSide = QuadCount + 1;
+	const int32 VertexCount = VerticesPerSide * VerticesPerSide;
+	const float Step = CellSize * static_cast<float>(1 << ClampedLOD);
+	const int32 Stride = 1 << ClampedLOD;
+	const int32 FullSide = QuadsPerSide + 3;
+	if (QuadCount <= 0 || SurfaceGrid.Num() != FullSide * FullSide)
+	{
+		return Streams;
+	}
+
+	auto HeightAt = [this, Stride, FullSide](int32 X, int32 Y) -> float
+	{
+		const int32 GridX = 1 + X * Stride;
+		const int32 GridY = 1 + Y * Stride;
+		return SurfaceGrid[GridX + (GridY * FullSide)].Height;
+	};
+
+	FTerrainStreamBuilder Builder(Streams);
+	Builder.EnableTangents<FPackedNormal>();
+	Builder.EnableTexCoords<FVector2f>();
+	Builder.EnableColors();
 
 	// Depth below the water surface at which waves reach full strength (vertex colour R = 255).
 	constexpr float FullWaveDepth = 30.0f;
@@ -3508,19 +3843,8 @@ void FTerrainGenerator::BuildWaterBuffers(const FTerrainMeshBuffers& Terrain, FT
 	WaterLevels.Add(SeaLevel);
 	TArray<FVector2D> LakeCenters;
 
-	TArray<FVector>& WaterVertices = OutWater.Vertices;
-	TArray<int32>& WaterTriangles = OutWater.Triangles;
-	TArray<FVector>& WaterNormals = OutWater.Normals;
-	TArray<FVector2D>& WaterUVs = OutWater.UVs;
-	TArray<FColor>& WaterColors = OutWater.Colors;
-	TArray<FProcMeshTangent>& WaterTangents = OutWater.Tangents;
-
-	WaterVertices.Reserve(VertexCount);
-	WaterNormals.Reserve(VertexCount);
-	WaterUVs.Reserve(VertexCount);
-	WaterColors.Reserve(VertexCount);
-	WaterTangents.Reserve(VertexCount);
-	WaterTriangles.Reserve(QuadCount * QuadCount * 6);
+	Builder.ReserveNumVertices(VertexCount);
+	Builder.ReserveNumTriangles(QuadCount * QuadCount * 2);
 
 	// Grid vertices are shared between neighbouring quads of the same water level; INDEX_NONE means not emitted yet.
 	// Each level has its own map, so a sea quad and a lake quad never weld across different surface heights.
@@ -3551,26 +3875,26 @@ void FTerrainGenerator::BuildWaterBuffers(const FTerrainMeshBuffers& Terrain, FT
 			const float WaterZ = WaterLevels[LevelIndex];
 
 			// Wave attenuation mask: 0 where the terrain touches or rises above the water, 1 over deep water.
-			const float TerrainHeight = CachedHeight(Heights, HeightsPerSide, X, Y);
+			const float TerrainHeight = HeightAt(X, Y);
 			const float DepthAlpha = FMath::Clamp((WaterZ - TerrainHeight) / FullWaveDepth, 0.0f, 1.0f);
 			const uint8 WaveMask = static_cast<uint8>(FMath::RoundToInt(DepthAlpha * 255.0f));
 
-			Index = WaterVertices.Add(FVector(LocalX, LocalY, WaterZ));
-			WaterNormals.Add(FVector::UpVector);
-			WaterTangents.Add(FProcMeshTangent(1.0f, 0.0f, 0.0f));
-			WaterUVs.Add(FVector2D((ChunkOriginX + LocalX) * UVScale, (ChunkOriginY + LocalY) * UVScale));
-			WaterColors.Add(FColor(WaveMask, WaveMask, WaveMask, 255));
+			const uint32 Added = Builder.AddVertex(FVector3f(LocalX, LocalY, WaterZ));
+			Builder.SetNormalAndTangent(Added, FVector3f::UpVector, FVector3f::XAxisVector);
+			Builder.SetTexCoord(Added, 0, FVector2f((ChunkOriginX + LocalX) * UVScale, (ChunkOriginY + LocalY) * UVScale));
+			Builder.SetColor(Added, FColor(WaveMask, WaveMask, WaveMask, 255));
+			Index = static_cast<int32>(Added);
 		}
 		return Index;
 	};
 
-	auto AnyCornerAtOrBelow = [&Heights, HeightsPerSide](int32 X, int32 Y, float Level, float Tolerance = 0.0f)
+	auto AnyCornerAtOrBelow = [&HeightAt](int32 X, int32 Y, float Level, float Tolerance = 0.0f)
 	{
 		const float Limit = Level + Tolerance;
-		return CachedHeight(Heights, HeightsPerSide, X, Y) <= Limit ||
-			CachedHeight(Heights, HeightsPerSide, X + 1, Y) <= Limit ||
-			CachedHeight(Heights, HeightsPerSide, X, Y + 1) <= Limit ||
-			CachedHeight(Heights, HeightsPerSide, X + 1, Y + 1) <= Limit;
+		return HeightAt(X, Y) <= Limit ||
+			HeightAt(X + 1, Y) <= Limit ||
+			HeightAt(X, Y + 1) <= Limit ||
+			HeightAt(X + 1, Y + 1) <= Limit;
 	};
 
 	for (int32 Y = 0; Y < QuadCount; ++Y)
@@ -3588,8 +3912,8 @@ void FTerrainGenerator::BuildWaterBuffers(const FTerrainMeshBuffers& Terrain, FT
 			{
 				// The deepest corner must be submerged but no deeper than the bowl, otherwise the quad sits over a drop-off.
 				const float LowestCornerZ = FMath::Min(
-					FMath::Min(CachedHeight(Heights, HeightsPerSide, X, Y), CachedHeight(Heights, HeightsPerSide, X + 1, Y)),
-					FMath::Min(CachedHeight(Heights, HeightsPerSide, X, Y + 1), CachedHeight(Heights, HeightsPerSide, X + 1, Y + 1)));
+					FMath::Min(HeightAt(X, Y), HeightAt(X + 1, Y)),
+					FMath::Min(HeightAt(X, Y + 1), HeightAt(X + 1, Y + 1)));
 				const float BedDepthActual = Lake.WaterZ - LowestCornerZ;
 				bValidLakeFloor = BedDepthActual >= 0.0f && BedDepthActual <= Lake.BedDepth + LakeFloorTolerance;
 			}
@@ -3610,12 +3934,15 @@ void FTerrainGenerator::BuildWaterBuffers(const FTerrainMeshBuffers& Terrain, FT
 				continue;
 			}
 
-			const int32 BottomLeft = GetOrAddWaterVertex(X, Y, LevelIndex);
-			const int32 BottomRight = GetOrAddWaterVertex(X + 1, Y, LevelIndex);
-			const int32 TopLeft = GetOrAddWaterVertex(X, Y + 1, LevelIndex);
-			const int32 TopRight = GetOrAddWaterVertex(X + 1, Y + 1, LevelIndex);
+			const uint32 BottomLeft = GetOrAddWaterVertex(X, Y, LevelIndex);
+			const uint32 BottomRight = GetOrAddWaterVertex(X + 1, Y, LevelIndex);
+			const uint32 TopLeft = GetOrAddWaterVertex(X, Y + 1, LevelIndex);
+			const uint32 TopRight = GetOrAddWaterVertex(X + 1, Y + 1, LevelIndex);
 
-			AppendQuad(WaterTriangles, BottomLeft, BottomRight, TopLeft, TopRight, false);
+			Builder.AddTriangle(BottomLeft, TopLeft, BottomRight);
+			Builder.AddTriangle(BottomRight, TopLeft, TopRight);
 		}
 	}
+
+	return Streams;
 }
