@@ -225,6 +225,9 @@ void StopTerrainResidentDiagnostics()
 
 void ATerrainManager::BeginPlay()
 {
+	// Preview actors live in the editor world. Drop them before the session spawns the real grid.
+	ClearEditorPreview();
+
 	Super::BeginPlay();
 
 	// Clients rebuild meshes from replicated InitData and need the same numbers. The chunk also loads on first use,
@@ -320,6 +323,82 @@ void ATerrainManager::EnsureGenerationAssetsLoaded() const
 	}
 
 	bGenerationAssetsLoaded = true;
+}
+
+void ATerrainManager::RebuildEditorPreview()
+{
+	UWorld* World = GetWorld();
+	if (!World || World->IsGameWorld())
+	{
+		return;
+	}
+
+	ClearEditorPreview();
+	EnsureGenerationAssetsLoaded();
+
+	UClass* ClassToSpawn = ChunkClass ? ChunkClass.Get() : ATerrainChunk::StaticClass();
+	const int32 Radius = FMath::Clamp(EditorPreviewRadius, 0, 8);
+
+	for (int32 Y = -Radius; Y <= Radius; ++Y)
+	{
+		for (int32 X = -Radius; X <= Radius; ++X)
+		{
+			const FIntPoint Coords(X, Y);
+			const FVector SpawnLocation(Coords.X * ATerrainChunk::ChunkWorldSize, Coords.Y * ATerrainChunk::ChunkWorldSize, 0.0f);
+			const FTransform SpawnTransform(SpawnLocation);
+
+			// SpawnActorDeferred's template builds its own parameters, so the transient flag would be dropped.
+			// bDeferConstruction is that same deferred path, and ObjectFlags keeps the chunk out of the level file.
+			FActorSpawnParameters SpawnParameters;
+			SpawnParameters.Owner = this;
+			SpawnParameters.OverrideLevel = GetLevel();
+			SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			SpawnParameters.ObjectFlags |= RF_Transient;
+			SpawnParameters.bDeferConstruction = true;
+
+			ATerrainChunk* Chunk = World->SpawnActor<ATerrainChunk>(ClassToSpawn, SpawnTransform, SpawnParameters);
+			if (!Chunk)
+			{
+				UE_LOG(LogTerrainManager, Error, TEXT("%s: editor preview failed to spawn chunk at (%d, %d)."), *GetName(), Coords.X, Coords.Y);
+				continue;
+			}
+
+			FChunkInitData InitData;
+			InitData.Seed = WorldSeed;
+			InitData.Coords = Coords;
+			Chunk->SetTerrainManager(this);
+			Chunk->InitializeEditorPreview(InitData, bEditorPreviewRunPCG);
+			Chunk->FinishSpawning(SpawnTransform);
+			if (bEditorPreviewRunPCG)
+			{
+				Chunk->GenerateEditorPreviewPCG();
+			}
+			EditorPreviewChunks.Add(Chunk);
+		}
+	}
+}
+
+void ATerrainManager::ClearEditorPreview()
+{
+	for (const TObjectPtr<ATerrainChunk>& Chunk : EditorPreviewChunks)
+	{
+		if (!IsValid(Chunk))
+		{
+			continue;
+		}
+
+		Chunk->ReleaseEditorPreviewPCG();
+		Chunk->ResetChunkState();
+		Chunk->Destroy();
+	}
+
+	EditorPreviewChunks.Empty();
+}
+
+void ATerrainManager::Destroyed()
+{
+	ClearEditorPreview();
+	Super::Destroyed();
 }
 
 void ATerrainManager::EndPlay(const EEndPlayReason::Type EndPlayReason)

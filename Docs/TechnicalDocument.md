@@ -399,7 +399,7 @@ sequenceDiagram
 
 - `ATerrainChunk` и `ATerrainManager` реплицируются, движение актёров не реплицируется.
 - Реплицируется только `InitData`.
-- `NetCullDistanceSquared = (16 · ChunkWorldSize)²`, около 1 км.
+- `NetCullDistanceSquared = (10 · ChunkWorldSize)²`, 640 м: `StreamingRadius` 8 плюс `DespawnMargin` 2. Чанк в пуле уезжает в `(0, 0, -100000)`, выходит из этого радиуса, и клиент закрывает канал.
 - Визуальный LOD локальный и считается на рендер-потоке по `ScreenSize`. Отдельного таймера на чанк нет.
 - `ATerrainChunk` спит в сети: `NetDormancy = DORM_DormantAll`. `FlushNetDormancy` вызывается только когда authority меняет `InitData` — при инициализации клетки и при возврате в пул.
 - **Коллизия на authority** — `bServerCollisionEnabled`. Менеджер выставляет его в радиусе 2 чанков (128 м) от любого игрока. Отладочная сетка коллизию не включает.

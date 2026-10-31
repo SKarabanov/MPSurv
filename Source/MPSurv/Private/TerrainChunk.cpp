@@ -13,6 +13,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Net/UnrealNetwork.h"
 #include "PCGComponent.h"
+#include "Subsystems/PCGSubsystem.h"
 #include "TerrainManager.h"
 #include "TimerManager.h"
 
@@ -894,8 +895,8 @@ ATerrainChunk::ATerrainChunk()
 	PCGComponent->bActivated = false;
 	PCGComponent->GenerationTrigger = EPCGComponentGenerationTrigger::GenerateOnDemand;
 
-	// Streaming clients still need InitData well beyond the default net cull.
-	SetNetCullDistanceSquared(FMath::Square(16.0f * ChunkWorldSize));
+	// Matches the streamed lifetime: StreamingRadius 8 plus DespawnMargin 2.
+	SetNetCullDistanceSquared(FMath::Square(10.0f * ChunkWorldSize));
 }
 
 void ATerrainChunk::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -926,6 +927,11 @@ void ATerrainChunk::ResetChunkState()
 
 	SetActorHiddenInGame(true);
 	SetActorEnableCollision(false);
+
+	// Park the pooled actor below the world so every connection drops it. Relevancy uses this location
+	// on the server; a Stationary root ignores SetActorLocation until it is Movable again.
+	PrepareChunkForTeleport();
+	SetActorLocation(FVector(0.0f, 0.0f, -100000.0f));
 
 	bCollisionCooked = false;
 	bCollisionApplied = false;
@@ -1025,6 +1031,72 @@ void ATerrainChunk::PlaceAtChunkCoords()
 	{
 		RealtimeMeshComponent->UpdateComponentToWorld(EUpdateTransformFlags::None, ETeleportType::TeleportPhysics);
 	}
+}
+
+void ATerrainChunk::InitializeEditorPreview(const FChunkInitData& InData, bool /*bRunPCG*/)
+{
+	const UWorld* World = GetWorld();
+	if (!World || World->IsGameWorld() || InData.Seed == 0)
+	{
+		return;
+	}
+
+	// UPCGComponent::OnRegister skips editor preview actors. A normal registration puts the component
+	// into the set FPCGRuntimeGenScheduler walks on every console-variable flush. Destroying it
+	// while that set still holds the pointer calls a pure virtual.
+	bIsEditorPreviewActor = true;
+
+	InitData = InData;
+	InitData.bForceSynchronous = true;
+	++BuildSerial;
+	bPCGGenerated = false;
+	bHasGeneratedMesh = false;
+	bVisualLODsReady = false;
+	bGrassBuilt = false;
+	bGrassCacheReady = false;
+	CachedLOD0Grid.Reset();
+	SetCollisionEnabled(false);
+
+	if (PCGComponent)
+	{
+		// One local generate. Partition actors would register their own components with the scheduler.
+		PCGComponent->bIsComponentPartitioned = false;
+		PCGComponent->GenerationTrigger = EPCGComponentGenerationTrigger::GenerateOnDemand;
+		PCGComponent->bActivated = false;
+	}
+
+	PlaceAtChunkCoords();
+	GenerateTerrainMesh();
+}
+
+void ATerrainChunk::GenerateEditorPreviewPCG()
+{
+	const UWorld* World = GetWorld();
+	if (!World || World->IsGameWorld())
+	{
+		return;
+	}
+
+	bIsEditorPreviewActor = true;
+	GeneratePCG();
+}
+
+void ATerrainChunk::ReleaseEditorPreviewPCG()
+{
+	if (!PCGComponent)
+	{
+		return;
+	}
+
+	if (UPCGSubsystem* Subsystem = PCGComponent->GetSubsystem())
+	{
+		Subsystem->CancelGeneration(PCGComponent);
+		Subsystem->UnregisterExecutionSource(PCGComponent, /*bForce=*/true);
+	}
+
+	PCGComponent->CleanupLocalImmediate(/*bRemoveComponents=*/true);
+	PCGComponent->bActivated = false;
+	bPCGGenerated = false;
 }
 
 void ATerrainChunk::InitializeChunk(const FChunkInitData& InData)
@@ -1226,6 +1298,29 @@ void ATerrainChunk::OnRep_InitData()
 	}
 
 	AttachRealtimeMesh();
+
+	// A chunk replicated for another nearby player can still arrive here. Skip the mesh when this
+	// client is already outside the streamed ring (StreamingRadius 8 plus DespawnMargin 2).
+	if (const UWorld* World = GetWorld())
+	{
+		const APlayerController* Controller = World->GetFirstPlayerController();
+		const APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
+		if (Pawn)
+		{
+			const float PointX = Pawn->GetActorLocation().X / ChunkWorldSize;
+			const float PointY = Pawn->GetActorLocation().Y / ChunkWorldSize;
+			const float ChunkX = static_cast<float>(InitData.Coords.X);
+			const float ChunkY = static_cast<float>(InitData.Coords.Y);
+			const float DX = FMath::Max3(ChunkX - PointX, 0.0f, PointX - (ChunkX + 1.0f));
+			const float DY = FMath::Max3(ChunkY - PointY, 0.0f, PointY - (ChunkY + 1.0f));
+			constexpr float ClientKeepRadius = 10.0f;
+			if (DX * DX + DY * DY > FMath::Square(ClientKeepRadius))
+			{
+				return;
+			}
+		}
+	}
+
 	GenerateTerrainMesh();
 }
 
@@ -1568,6 +1663,12 @@ void ATerrainChunk::ApplyStoredCollision(bool bEnable)
 	if (!bEnable)
 	{
 		DisableStoredCollision();
+		return;
+	}
+
+	// Viewport preview builds the mesh only. A cook here would leave a body in the editor world.
+	if (const UWorld* World = GetWorld(); World && !World->IsGameWorld())
+	{
 		return;
 	}
 
@@ -3441,6 +3542,11 @@ void ATerrainChunk::GenerateTerrainMesh()
 	// The visual mesh and the height grid are built once. Radius changes only toggle collision and detail.
 	if (bHasGeneratedMesh && !bDedicatedNeedsGrid)
 	{
+		if (const UWorld* World = GetWorld(); World && !World->IsGameWorld())
+		{
+			return;
+		}
+
 		RefreshCollisionState();
 		if (NeedsDetailRefresh())
 		{
@@ -3473,6 +3579,13 @@ void ATerrainChunk::GenerateTerrainMesh()
 	Request.bBuildAllVisualLODs = !bDedicatedServer;
 
 	PopulateGrassRequest(Request);
+
+	// The editor preview is a viewport mesh. Grass instances and their HISMs stay out of it.
+	if (const UWorld* World = GetWorld(); World && !World->IsGameWorld())
+	{
+		Request.bBuildGrass = false;
+		Request.GrassRules.Reset();
+	}
 
 	bIsGenerating = true;
 	bRegenerationPending = false;
@@ -3682,6 +3795,17 @@ void ATerrainChunk::ApplyMesh(const FTerrainBuildRequest& Request, FTerrainBuild
 	}
 
 	bHasGeneratedMesh = true;
+
+	// Editor preview never cooks a body and never fills grass HISMs. Play mode owns both.
+	if (const UWorld* World = GetWorld(); World && !World->IsGameWorld())
+	{
+		if (RealtimeMeshComponent)
+		{
+			RealtimeMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		}
+		return;
+	}
+
 	RefreshCollisionState();
 	if (NeedsDetailRefresh())
 	{
@@ -3699,6 +3823,11 @@ void ATerrainChunk::ApplyMesh(const FTerrainBuildRequest& Request, FTerrainBuild
 UHierarchicalInstancedStaticMeshComponent* ATerrainChunk::EnsureGrassComponent(uint8 BiomeId)
 {
 	if (IsNetMode(NM_DedicatedServer))
+	{
+		return nullptr;
+	}
+
+	if (const UWorld* World = GetWorld(); World && !World->IsGameWorld())
 	{
 		return nullptr;
 	}

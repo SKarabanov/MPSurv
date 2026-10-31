@@ -55,9 +55,33 @@ public:
 	/** Spawns up to ChunksPerFrame chunks from GenerationQueue and polls pawn chunk cells. */
 	virtual void Tick(float DeltaTime) override;
 
+	/**
+	 * Editor viewport only. Drops any previous preview, then spawns a transient square of chunks
+	 * and builds each mesh on this thread. The actors are RF_Transient, so a level save does not keep them.
+	 */
+	UFUNCTION(CallInEditor, Category = "Terrain|Editor Preview")
+	void RebuildEditorPreview();
+
+	/** Editor viewport only. Destroys every chunk spawned by RebuildEditorPreview. */
+	UFUNCTION(CallInEditor, Category = "Terrain|Editor Preview")
+	void ClearEditorPreview();
+
+	/** Half-extent of the editor preview square, in chunks. 0 is the origin chunk, 2 is 5×5. */
+	UPROPERTY(EditAnywhere, Category = "Terrain|Editor Preview", meta = (ClampMin = "0", ClampMax = "8"))
+	int32 EditorPreviewRadius = 2;
+
+	/** When true, RebuildEditorPreview runs the chunk PCG graph after the mesh is uploaded. */
+	UPROPERTY(EditAnywhere, Category = "Terrain|Editor Preview")
+	bool bEditorPreviewRunPCG = true;
+
+	/** Transient chunks created by RebuildEditorPreview. Not part of the streaming set. */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<ATerrainChunk>> EditorPreviewChunks;
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void Destroyed() override;
 
 	/** Queues every chunk in the square [-GridRadius, GridRadius] on both axes, nearest to the origin first. Server only. */
 	void SpawnInitialGrid();

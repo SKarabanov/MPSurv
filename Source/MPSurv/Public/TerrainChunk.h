@@ -651,6 +651,19 @@ public:
 	void InitializeChunk(const FChunkInitData& InData);
 
 	/**
+	 * Editor viewport only. Builds the mesh on the calling thread from InData.
+	 * Collision is not cooked and grass HISMs are not created.
+	 * Call this before FinishSpawning. PCG runs afterwards, from GenerateEditorPreviewPCG.
+	 */
+	void InitializeEditorPreview(const FChunkInitData& InData, bool bRunPCG);
+
+	/** Editor viewport only. Scatters the chunk graph. The actor must already have finished spawning. */
+	void GenerateEditorPreviewPCG();
+
+	/** Drops this chunk from the PCG tracking set before the actor is destroyed. */
+	void ReleaseEditorPreviewPCG();
+
+	/**
 	 * Game thread. Returns the chunk to the manager pool: drops in-flight results via BuildSerial, hides the actor
 	 * and clears mesh, grass and PCG. Does not touch bIsGenerating; the running build's callback clears that flag,
 	 * and a reuse that arrives while it is still set raises bRegenerationPending from GenerateTerrainMesh.
