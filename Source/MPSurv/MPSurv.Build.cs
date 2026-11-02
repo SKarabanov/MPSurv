@@ -8,7 +8,7 @@ public class MPSurv : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "RealtimeMeshComponent", "PCG", "OnlineSubsystem", "OnlineSubsystemUtils", "OnlineSubsystemSteam" });
-		PrivateDependencyModuleNames.Add("RHI");
+		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "UMG", "CommonUI", "ModelViewViewModel", "RealtimeMeshComponent", "PCG", "OnlineSubsystem", "OnlineSubsystemUtils", "OnlineSubsystemSteam" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "RHI", "Slate", "SlateCore" });
 	}
 }

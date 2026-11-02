@@ -144,7 +144,7 @@ void USteamSessionSubsystem::OnCreateSessionComplete(FName /*SessionName*/, bool
 		OnSessionCreated.Broadcast(true);
 		if (UWorld* World = GetWorld())
 		{
-			World->ServerTravel(TEXT("TestTerrain?listen"));
+			World->ServerTravel(TEXT("/Game/MPS/Levels/L_GameWorld?listen"));
 		}
 		return;
 	}

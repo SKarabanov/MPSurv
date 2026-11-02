@@ -1,7 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "MPSurv.h"
-#include "PCGProceduralMeshSampler.h"
+#include "Terrain/PCGProceduralMeshSampler.h"
 #include "Modules/ModuleManager.h"
 
 void StartTerrainResidentDiagnostics();
