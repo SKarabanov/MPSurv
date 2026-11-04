@@ -24,6 +24,9 @@ public:
 
 	virtual void Deinitialize() override;
 
+	/** Lobby metadata key so AppId 480 searches return only MPSurv sessions. */
+	static const FName MPSURV_SESSION_KEY;
+
 	/** Fired when Steam finishes creating the session. bWasSuccessful is false when the request is rejected. */
 	UPROPERTY(BlueprintAssignable, Category = "Steam|Session")
 	FSteamSessionCreatedDelegate OnSessionCreated;

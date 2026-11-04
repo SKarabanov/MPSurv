@@ -71,6 +71,7 @@ void UServerBrowserViewModel::SetIsSearching(bool bNewIsSearching)
 void UServerBrowserViewModel::SetServerList(const TArray<UServerRowViewModel*>& NewServerList)
 {
 	ServerList = NewServerList;
+	// UE 5.8: expands to BroadcastFieldValueChanged(FFieldNotificationClassDescriptor::ServerList).
 	UE_MVVM_BROADCAST_FIELD_VALUE_CHANGED(ServerList);
 }
 
@@ -90,7 +91,9 @@ void UServerBrowserViewModel::HandleSessionsFound(const TArray<FBlueprintSession
 		}
 	}
 
-	SetServerList(Rows);
+	ServerList = Rows;
+	// ListView bindings listen to FieldNotify; without this broadcast the widget keeps the previous empty list.
+	UE_MVVM_BROADCAST_FIELD_VALUE_CHANGED(ServerList);
 }
 
 USteamSessionSubsystem* UServerBrowserViewModel::GetSessionSubsystem() const

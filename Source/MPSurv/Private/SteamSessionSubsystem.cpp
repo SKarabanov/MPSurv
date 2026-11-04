@@ -16,6 +16,8 @@ DEFINE_LOG_CATEGORY_STATIC(LogSteamSession, Log, All);
 #define SEARCH_PRESENCE FName(TEXT("PRESENCESEARCH"))
 #endif
 
+const FName USteamSessionSubsystem::MPSURV_SESSION_KEY = FName(TEXT("MPSurvGameKey"));
+
 USteamSessionSubsystem::USteamSessionSubsystem()
 	: CreateSessionCompleteDelegate(FOnCreateSessionCompleteDelegate::CreateUObject(this, &ThisClass::OnCreateSessionComplete))
 	, FindSessionsCompleteDelegate(FOnFindSessionsCompleteDelegate::CreateUObject(this, &ThisClass::OnFindSessionsComplete))
@@ -66,6 +68,7 @@ void USteamSessionSubsystem::CreateSteamSession(int32 MaxPlayers)
 	Settings.bShouldAdvertise = true;
 	Settings.NumPublicConnections = MaxPlayers;
 	Settings.Set(SETTING_MAPNAME, FString(TEXT("TestTerrain")), EOnlineDataAdvertisementType::ViaOnlineService);
+	Settings.Set(MPSURV_SESSION_KEY, FString(TEXT("true")), EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
 
 	CreateSessionCompleteHandle = Sessions->AddOnCreateSessionCompleteDelegate_Handle(CreateSessionCompleteDelegate);
 	if (!Sessions->CreateSession(*UserId, NAME_GameSession, Settings) && CreateSessionCompleteHandle.IsValid())
@@ -100,9 +103,10 @@ void USteamSessionSubsystem::FindSteamSessions(int32 MaxSearchResults)
 	SessionSearch->QuerySettings.Set(SEARCH_PRESENCE, true, EOnlineComparisonOp::Equals);
 	// Steam routes advertised sessions through the lobby search when this key is set.
 	SessionSearch->QuerySettings.Set(SEARCH_LOBBIES, true, EOnlineComparisonOp::Equals);
+	SessionSearch->QuerySettings.Set(MPSURV_SESSION_KEY, FString(TEXT("true")), EOnlineComparisonOp::Equals);
 
-	UE_LOG(LogTemp, Warning, TEXT("FindSteamSessions: MaxSearchResults=%d (caller asked %d), LAN=false, SEARCH_PRESENCE+SEARCH_LOBBIES."),
-		SessionSearch->MaxSearchResults, MaxSearchResults);
+	UE_LOG(LogTemp, Warning, TEXT("FindSteamSessions: MaxSearchResults=%d (caller asked %d), LAN=false, SEARCH_PRESENCE+SEARCH_LOBBIES, filter=%s."),
+		SessionSearch->MaxSearchResults, MaxSearchResults, *MPSURV_SESSION_KEY.ToString());
 
 	FindSessionsCompleteHandle = Sessions->AddOnFindSessionsCompleteDelegate_Handle(FindSessionsCompleteDelegate);
 	if (!Sessions->FindSessions(*UserId, SessionSearch.ToSharedRef()) && FindSessionsCompleteHandle.IsValid())
