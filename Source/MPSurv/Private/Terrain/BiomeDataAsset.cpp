@@ -7,8 +7,13 @@ FPrimaryAssetId UBiomeDataAsset::GetPrimaryAssetId() const
 	return FPrimaryAssetId(TEXT("BiomeSettings"), GetFName());
 }
 
-void UBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& /*Settings*/) const
+void UBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	const int32 Index = static_cast<int32>(BiomeType);
+	if (Index >= 0 && Index < BiomeTypeCount)
+	{
+		Settings.PossiblePOIs[Index] = PossiblePOIs;
+	}
 }
 
 UOceanBiomeDataAsset::UOceanBiomeDataAsset()
@@ -18,6 +23,7 @@ UOceanBiomeDataAsset::UOceanBiomeDataAsset()
 
 void UOceanBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.OceanMaxDepth = OceanMaxDepth;
 	Settings.OceanHillsFrequency = OceanHillsFrequency;
 	Settings.OceanHillsAmplitude = OceanHillsAmplitude;
@@ -32,6 +38,7 @@ UPlainsBiomeDataAsset::UPlainsBiomeDataAsset()
 
 void UPlainsBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.PlainsHillsFrequency = PlainsHillsFrequency;
 	Settings.PlainsHillsAmplitude = PlainsHillsAmplitude;
 	Settings.PlainsDetailFrequency = PlainsDetailFrequency;
@@ -45,6 +52,7 @@ UForestBiomeDataAsset::UForestBiomeDataAsset()
 
 void UForestBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.ForestHillsFrequency = ForestHillsFrequency;
 	Settings.ForestHillsHeight = ForestHillsHeight;
 	Settings.ForestDetailFrequency = ForestDetailFrequency;
@@ -58,6 +66,7 @@ USwampBiomeDataAsset::USwampBiomeDataAsset()
 
 void USwampBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.SwampBaseHeight = SwampBaseHeight;
 	Settings.SwampPuddleNoiseFrequency = SwampPuddleNoiseFrequency;
 	Settings.SwampPuddleDepth = SwampPuddleDepth;
@@ -71,6 +80,7 @@ UPlateauBiomeDataAsset::UPlateauBiomeDataAsset()
 
 void UPlateauBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.PlateauHeight = PlateauHeight;
 	Settings.CanyonFrequency = CanyonFrequency;
 	Settings.CanyonWidth = CanyonWidth;
@@ -88,6 +98,7 @@ UMountainsBiomeDataAsset::UMountainsBiomeDataAsset()
 
 void UMountainsBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.MountainMaxHeight = MountainMaxHeight;
 	Settings.RidgeFrequency = RidgeFrequency;
 	Settings.MountainsBaseHillsFrequency = MountainsBaseHillsFrequency;
@@ -103,6 +114,7 @@ UDesertBiomeDataAsset::UDesertBiomeDataAsset()
 
 void UDesertBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.DesertDuneFrequency = DesertDuneFrequency;
 	Settings.DesertDuneAmplitude = DesertDuneAmplitude;
 	Settings.DesertBaseHeight = DesertBaseHeight;
@@ -117,6 +129,7 @@ UOasisBiomeDataAsset::UOasisBiomeDataAsset()
 
 void UOasisBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.OasisSpawnChance = OasisSpawnChance;
 	Settings.OasisRadius = OasisRadius;
 	Settings.OasisWaterRadius = OasisWaterRadius;
@@ -130,6 +143,7 @@ UTundraBiomeDataAsset::UTundraBiomeDataAsset()
 
 void UTundraBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.TundraHillsFrequency = TundraHillsFrequency;
 	Settings.TundraHillsAmplitude = TundraHillsAmplitude;
 	Settings.TundraDetailFrequency = TundraDetailFrequency;
@@ -143,6 +157,7 @@ UJungleBiomeDataAsset::UJungleBiomeDataAsset()
 
 void UJungleBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.JungleHillsFrequency = JungleHillsFrequency;
 	Settings.JungleHillsHeight = JungleHillsHeight;
 	Settings.JungleDetailFrequency = JungleDetailFrequency;
@@ -156,6 +171,7 @@ UFoothillsBiomeDataAsset::UFoothillsBiomeDataAsset()
 
 void UFoothillsBiomeDataAsset::ApplyTo(FTerrainGenerationSettings& Settings) const
 {
+	Super::ApplyTo(Settings);
 	Settings.FoothillsDetailFrequency = FoothillsDetailFrequency;
 	Settings.FoothillsDetailAmplitude = FoothillsDetailAmplitude;
 }

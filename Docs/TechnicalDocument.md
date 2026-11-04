@@ -1,19 +1,15 @@
 # MPSurv — технический документ
 
-Состояние на 30.10.2026. Документ описывает код в `Source/MPSurv`. Единицы мира — сантиметры (1 м = 100 см).
+Состояние на 04.11.2026. Документ описывает код в `Source/MPSurv`. Единицы мира — сантиметры (1 м = 100 см).
 
 ## 1. Обзор
 
-MPSurv — мультиплеерный survival-проект на Unreal Engine 5.8 (C++). Основная реализованная подсистема — бесконечный процедурный ландшафт:
+MPSurv — мультиплеерный survival-проект на Unreal Engine 5.8 (C++). Основные подсистемы:
 
-- мир делится на квадратные чанки 64 × 64 м; сервер спавнит их и складывает лишние в пул, а не уничтожает;
-- рельеф строится детерминированно из `Seed` и координат чанка, поэтому по сети реплицируются только эти данные, а не геометрия;
-- острова и океаны задаёт шум континентальности, биомы суши — сетка Вороного с кольцами и широтными полосами;
-- одна сборка считает высоту один раз на сетке 67 × 67 (вершины LOD 0 плюс бордюр в одну клетку). Визуальные LOD, вода, коллизия и трава только читают эту сетку;
-- на машине, которая рисует, все три визуальных LOD и вода заливаются в `URealtimeMeshComponent` один раз на `InitData`. Дальше LOD выбирает рендерер по `ScreenSize`. Вход и выход из радиуса коллизии секции не пересобирают;
-- коллизия — отдельный complex mesh с шагом 2 м, а не секция визуального меша. Трава и PCG живут в том же радиусе, что и коллизия.
-
-Кроме ландшафта есть базовый персонаж от третьего лица на Enhanced Input и сэмплер PCG, который читает кэш сетки LOD 0.
+- **Ландшафт.** Бесконечные чанки 64 × 64 м; сервер спавнит их и складывает лишние в пул. Рельеф детерминирован из `Seed` и координат: по сети уходит только `InitData`, не геометрия. Острова и океаны — шум континентальности; суша — сетка Вороного с кольцами и широтами. Одна сборка считает высоту на сетке 67 × 67; визуальные LOD, вода, коллизия и трава только читают её. На клиенте все три LOD и вода заливаются в `URealtimeMeshComponent` один раз на `InitData`; дальше LOD выбирает рендерер по `ScreenSize`. Коллизия — complex mesh с шагом 2 м. Трава и PCG живут в том же радиусе, что и коллизия. Данные POI (тип, веса, радиусы сглаживания, soft class актёра) уже лежат на биоме и в снимке генерации; спавн и выравнивание рельефа под фундамент ещё не подключены к `ComputeHeight`.
+- **Сеть.** Online Subsystem Steam: создание / поиск / join сессий, `ServerTravel` на игровой уровень как listen-сервер. Репликация `InitData` настроена под Push Model / Iris.
+- **UI.** CommonUI-слои, MVVM (главное меню, server browser, тосты), `UUIManagerSubsystem` на `ULocalPlayer` переживает travel и сбрасывает layout при выгрузке мира меню.
+- **Персонаж.** Третье лицо на Enhanced Input; PCG-сэмплер читает кэш сетки LOD 0.
 
 ## 2. Стек и конфигурация
 
@@ -21,15 +17,17 @@ MPSurv — мультиплеерный survival-проект на Unreal Engine
 |---|---|
 | Движок | Unreal Engine 5.8 (`EngineAssociation: 5.8`) |
 | Модуль | `MPSurv` (Runtime) |
-| Зависимости модуля | Core, CoreUObject, Engine, InputCore, EnhancedInput, RealtimeMeshComponent, PCG. Приватно — RHI |
-| Плагины геймплея | RealtimeMeshComponent, PCG |
+| Public-зависимости | Core, CoreUObject, Engine, InputCore, EnhancedInput, UMG, CommonUI, ModelViewViewModel, RealtimeMeshComponent, PCG, OnlineSubsystem, OnlineSubsystemUtils, OnlineSubsystemSteam, IrisCore, NetCore |
+| Private-зависимости | RHI, Slate, SlateCore |
+| Плагины геймплея | RealtimeMeshComponent, PCG, OnlineSubsystemSteam, CommonUI, ModelViewViewModel, GameplayStateTree |
 | Плагины редактора | ModelingToolsEditorMode, ModelContextProtocol, AllToolsets, NiagaraToolsets, PhysicsToolsets, EditorToolset, GASToolsets, Terminal |
+| Steam OSS | `DefaultPlatformService=Steam`, `SteamDevAppId=480` (Spacewar), `bInitServerOnClient=true`. GameNetDriver — `SteamNetDriver` с fallback `IpNetDriver` |
 | Рендер | DX12 SM6, Substrate. Distance Fields выключены (`r.GenerateMeshDistanceFields=False`), аппаратный ray tracing выключен (`r.RayTracing=False`), GPU Scene не резервирует буферы (`r.GPUScene.UseReservedResources=0`). Глобальное освещение выключено (`r.DynamicGlobalIlluminationMethod=0`), отражения — screen space (`r.ReflectionMethod=2`), Virtual Shadow Maps выключены (`r.Shadow.Virtual.Enable=0`), статическое освещение выключено |
 | Объёмные облака и туман | `r.VolumetricCloud.ViewRaySampleCountMax=64`, `ShadowMap.MaxResolution=256`, `ReflectionRaySampleCountMax=0`, `HighQualityAerialPerspective=0`, `StepSize=2`. Туман: `r.VolumetricFog.GridPixelSize=16`, `GridSizeZ=64`. Motion blur и depth of field выключены (`r.MotionBlurQuality=0`, `r.DepthOfFieldQuality=0`) |
 | Частота кадров | `bSmoothFrameRate=True`, `SmoothedFrameRateRange` от 22 до 60 FPS (верхняя граница Exclusive). В фоне действует `bUseBackgroundFrameRateLimit` |
-| Карта по умолчанию | `/Game/MPS/Levels/TestTerrain.TestTerrain` |
+| Карта по умолчанию | `GameDefaultMap=/Game/MPS/Levels/L_MainMenu`. Игровой уровень после хоста — `/Game/MPS/Levels/L_GameWorld`. `EditorStartupMap` — `/Game/MPS/Levels/TestTerrain` |
 
-Стандарты кода: Epic Coding Standard, типы UE (`TArray`, `FString`, `FVector`…) вместо `std::`. Единственное исключение — `std::atomic<bool>` для флага фоновой сборки. Воркер не обращается к UObject.
+Стандарты кода: Epic Coding Standard, типы UE (`TArray`, `FString`, `FVector`…) вместо `std::`. Единственное исключение — `std::atomic<bool>` для флага фоновой сборки. Воркер не обращается к UObject и не резолвит soft class / soft object.
 
 Чанк ландшафта пишет динамическую тень с LOD 0 и LOD 1. LOD 2 и вода тень не отбрасывают. Distance field и навигацию чанк не двигает. Статического освещения в проекте нет, поэтому тень идёт только динамическим проходом.
 
@@ -40,25 +38,30 @@ Source/MPSurv/
 ├── MPSurv.Build.cs
 ├── Public/
 │   ├── MPSurv.h
-│   ├── TerrainChunk.h          — чанк, настройки генерации, биомы, LOD
-│   ├── TerrainManager.h        — спавн, пул, стриминг
-│   ├── WorldGenSettings.h      — общий Primary Data Asset мира
-│   ├── BiomeDataAsset.h        — Primary Data Asset одного биома и его трава
-│   ├── PCGProceduralMeshSampler.h
-│   ├── BaseCharacter.h
-│   └── PlayerCharacter.h
+│   ├── SteamSessionSubsystem.h
+│   ├── BaseCharacter.h / PlayerCharacter.h
+│   ├── Terrain/
+│   │   ├── TerrainChunk.h          — чанк, FTerrainGenerationSettings, биомы, EPOIType/FPOIData, LOD
+│   │   ├── TerrainManager.h
+│   │   ├── WorldGenSettings.h
+│   │   ├── BiomeDataAsset.h        — форма биома, GrassRules, PossiblePOIs
+│   │   └── PCGProceduralMeshSampler.h
+│   └── UI/
+│       ├── BasePrimaryLayout.h / UIManagerSubsystem.h / BaseScreenWidget.h
+│       ├── BaseViewModel.h / MainMenuViewModel.h / GlobalStateViewModel.h
+│       ├── ServerBrowserViewModel.h / ServerRowViewModel.h
+│       └── BaseToastWidget.h
 └── Private/
-    ├── MPSurv.cpp              — регистрация аксессора $Normal для точек PCG
-    ├── TerrainChunk.cpp        — генерация, меш, коллизия, трава
-    ├── TerrainManager.cpp
-    ├── WorldGenSettings.cpp
-    ├── BiomeDataAsset.cpp
-    ├── PCGProceduralMeshSampler.cpp
-    ├── BaseCharacter.cpp
-    └── PlayerCharacter.cpp
+    ├── MPSurv.cpp                  — аксессор $Normal для точек PCG
+    ├── SteamSessionSubsystem.cpp
+    ├── BaseCharacter.cpp / PlayerCharacter.cpp
+    ├── Terrain/                    — зеркало Public/Terrain
+    └── UI/                         — зеркало Public/UI
 ```
 
-Математика рельефа — класс `FTerrainGenerator` в `TerrainChunk.cpp`. Он наследует `FTerrainGenerationSettings` и хранит только копии чисел.
+Инклюды проектных заголовков — с путём (`"Terrain/..."`, `"UI/..."`). `#include "Class.generated.h"` у UHT остаётся без префикса папки: сгенерированные файлы лежат плоско в `Intermediate/.../UHT/`.
+
+Математика рельефа — класс `FTerrainGenerator` в `TerrainChunk.cpp`. Он наследует `FTerrainGenerationSettings` и хранит только копии чисел, включая `PossiblePOIs[BiomeTypeCount]`.
 
 ## 4. Архитектура
 
@@ -85,17 +88,22 @@ flowchart TD
 | `ATerrainManager` | Сетка чанков на сервере: режимы спавна, очередь, стриминг, пул, радиус коллизии |
 | `ATerrainChunk` | Реплицируемый актёр-чанк: сборка, секции Realtime Mesh, коллизия, трава, PCG |
 | `FTerrainGenerator` | Математика генерации. Не обращается к UObject |
-| `FTerrainGenerationSettings` | POD всех чисел генерации. Игровой поток заполняет его из ассетов перед каждой сборкой |
+| `FTerrainGenerationSettings` | POD всех чисел генерации, в том числе `PossiblePOIs[BiomeTypeCount]`. Игровой поток заполняет его из ассетов перед каждой сборкой |
 | `UWorldGenSettings` | Primary Data Asset общей формы мира |
-| `UBiomeDataAsset` | Primary Data Asset одного биома: его форма и `GrassRules`. На каждый ID свой наследник |
+| `UBiomeDataAsset` | Primary Data Asset одного биома: форма, `GrassRules`, `PossiblePOIs`. На каждый ID свой наследник |
+| `EPOIType` / `FPOIData` | Тип POI (`None`, `Altar`, `Ruins`, `Dungeon`) и вариант: вес, `FlattenRadius`, `BlendRadius`, `TSoftClassPtr<AActor>` |
 | `FChunkInitData` | Реплицируемые данные: `Seed`, `Coords`, `bForceSynchronous` |
 | `FTerrainBuildRequest` / `FTerrainBuildResult` | Что собрать и потоки всех визуальных LOD, воды, кэш сетки и инстансы травы |
 | `FTerrainGridSample` | Один узел полной детализации: высота, нормаль, тангенс, цвет пары биомов, строгий ID |
 | `FRingZoneSettings` / `FBiomeWeight` | Кольцо биомов: внешний радиус и взвешенный набор биомов |
 | `UPCGProceduralMeshSamplerSettings` | Нода PCG `PCG_ProceduralMeshSampler`. Читает `CachedLOD0Grid` |
-| `EBiomeType` | Ocean=0, Plains=1, Forest=2, Swamp=3, Plateau=4, Mountains=5, Desert=6, Oasis=7, Tundra=8, Jungle=9, Foothills=10 |
+| `EBiomeType` | Ocean=0 … Foothills=10; `BiomeTypeCount = 11` |
+| `USteamSessionSubsystem` | GameInstance-подсистема: create / find / join Steam-сессий |
+| `UUIManagerSubsystem` | LocalPlayer-подсистема: layout, слои CommonUI, тосты, `ApplyGameplayInputMode` |
 
 Оазис, тундра, джунгли и предгорья не разыгрываются как обычная ячейка Вороного внутри кольца. Оазис пишется внутри пустыни, предгорья — на низкой горной поверхности, тундра и джунгли — широтными полосами поверх колец.
+
+**POI.** На каждом `UBiomeDataAsset` — массив `PossiblePOIs`: несколько взвешенных вариантов внутри одного биома. `ApplyTo` (базовый класс, вызывается через `Super` у наследников) копирует массив в `FTerrainGenerationSettings::PossiblePOIs[BiomeType]`. Soft class на воркер не резолвится: генератор читает только Type / Weight / радиусы. Выравнивание высоты под фундамент и спавн актёра ещё не вшиты в `ComputeHeight` / менеджер.
 
 ## 5. Сетка и система координат
 
@@ -398,10 +406,12 @@ sequenceDiagram
 ## 9. Сеть и радиус коллизии
 
 - `ATerrainChunk` и `ATerrainManager` реплицируются, движение актёров не реплицируется.
-- Реплицируется только `InitData`.
-- `NetCullDistanceSquared = (10 · ChunkWorldSize)²`, 640 м: `StreamingRadius` 8 плюс `DespawnMargin` 2. Чанк в пуле уезжает в `(0, 0, -100000)`, выходит из этого радиуса, и клиент закрывает канал.
+- Реплицируется только `InitData` (`FChunkInitData` — обычный `USTRUCT` с `UPROPERTY`, без кастомного `NetSerialize`; для Iris это подходит).
+- **Push Model / Iris.** В `GetLifetimeReplicatedProps` — `DOREPLIFETIME_WITH_PARAMS_FAST` с `bIsPushBased = true`. После записи `InitData` в `InitializeChunk` и `ResetChunkState` вызывается `MARK_PROPERTY_DIRTY_FROM_NAME(ATerrainChunk, InitData, this)`. Модули `IrisCore` и `NetCore` в public-зависимостях. Полный runtime-opt-in Iris (`bUseIris`, `net.Iris.UseIrisReplication`) настраивается отдельно в Target / ini при необходимости.
+- `NetCullDistanceSquared = (10 · ChunkWorldSize)²`, 640 м: `StreamingRadius` 8 плюс `DespawnMargin` 2. Чанк в пуле уезжает в `(0, 0, -100000)`, выходит из этого радиуса, и клиент закрывает канал. Перед телепортом — `PrepareChunkForTeleport` (Movable).
 - Визуальный LOD локальный и считается на рендер-потоке по `ScreenSize`. Отдельного таймера на чанк нет.
 - `ATerrainChunk` спит в сети: `NetDormancy = DORM_DormantAll`. `FlushNetDormancy` вызывается только когда authority меняет `InitData` — при инициализации клетки и при возврате в пул.
+- На клиенте `OnRep_InitData` пропускает генерацию меша, если пешка дальше ~10 чанков от квадрата клетки (AABB Max3); без пешки генерация идёт.
 - **Коллизия на authority** — `bServerCollisionEnabled`. Менеджер выставляет его в радиусе 2 чанков (128 м) от любого игрока. Отладочная сетка коллизию не включает.
 - **Коллизия** — радиус 2 чанка. **Трава и PCG** включаются на том же радиусе и выключаются на радиусе 3, чтобы шаг вдоль границы клетки не пересоздавал их. На выходе HISM очищается и снимается с регистрации, компонент остаётся на чанке. `GeneratePCG` и обновление травы идут очередью менеджера, не больше одного чанка за кадр.
 - Менеджер на каждом тике сравнивает клетку пешки (`FIntPoint`) с прошлой. Пока пешка внутри того же квадрата 64 × 64 м, близость чанков не пересчитывается. Смена клетки обновляет коллизию сразу и ставит траву с PCG в очередь.
@@ -455,7 +465,7 @@ sequenceDiagram
 
 ### 13.1. Настройки генерации
 
-Общая форма мира — `UWorldGenSettings`. Форма биома и трава — наследник `UBiomeDataAsset` на каждый ID, включая тундру, джунгли и предгорья. Менеджер держит мягкие ссылки, на игровом потоке загружает ассеты и копирует числа в `FTerrainGenerationSettings`. Воркер получает только копию. Пустая ссылка оставляет дефолт структуры.
+Общая форма мира — `UWorldGenSettings`. Форма биома, трава и POI — наследник `UBiomeDataAsset` на каждый ID, включая тундру, джунгли и предгорья. Менеджер держит мягкие ссылки, на игровом потоке загружает ассеты и копирует числа в `FTerrainGenerationSettings` (в том числе `PossiblePOIs[BiomeType]`). Меши травы остаются на ассете и собираются в `ResolvedGrass` отдельно. Soft class POI на воркер не грузится. Пустая ссылка оставляет дефолт структуры.
 
 **Общие** (`UWorldGenSettings`)
 
@@ -509,6 +519,20 @@ sequenceDiagram
 | `ScaleMin` / `ScaleMax` | 0.85 / 1.25 |
 | `CullDistanceStart` / `CullDistanceEnd` | 8000 / 12000 |
 
+У Tundra / Jungle / Foothills `GrassRules` по умолчанию пустые — трава этих биомов не сажается, пока ассет не заполнят.
+
+**POI** на записи `PossiblePOIs` биома
+
+| Параметр | По умолчанию |
+|---|---|
+| `Type` | `None` (`Altar` / `Ruins` / `Dungeon`) |
+| `Weight` | 1.0 |
+| `FlattenRadius` | 2000 см |
+| `BlendRadius` | 1500 см |
+| `POIActorClass` | не задан (`TSoftClassPtr<AActor>`) |
+
+Несколько записей в одном биоме — взвешенный выбор варианта. Логика flatten / spawn ещё не подключена к генератору.
+
 ### 13.2. Чанк
 
 | Параметр | По умолчанию |
@@ -548,14 +572,37 @@ sequenceDiagram
 - **Коллизия реже визуальной сетки.** Тело берёт каждый второй узел LOD 0. Щели уже 2 м физика не повторяет.
 - **`GetTerrainDeltaHeight` и `RemoveGrassInRadius`** — заглушки.
 - **`ABaseCharacter`** — пустая заготовка с включённым Tick.
+- **POI.** Структуры и прокидывание в `FTerrainGenerationSettings` есть; flatten / spawn в генераторе и менеджере ещё нет.
 - **Подъём стартового острова** меняет континентальность и не меняет розыгрыш биома. Это описано у `StartIslandRadius`.
 - **Старые поля ассета мира.** Пока `DA_WorldGenSettings` не пересохранён, в нём могут лежать удалённые из кода свойства. Код их не читает.
+- **SteamDevAppId=480** — Spacewar; для релиза заменить на свой App ID.
 
 ## 16. Настройка сцены
 
 1. Поставить на уровень `ATerrainManager` и задать ненулевой `WorldSeed`.
-2. Назначить `UWorldGenSettings` и по ассету биома на каждый используемый ID, включая тундру, джунгли и предгорья. Пустые `GrassRules` траву этого биома не сажают.
-3. Для осмотра: `SpawnMode = StaticDebugGrid`, Simulate. Коллизии нет, персонаж провалится.
-4. Для игры: `SpawnMode = DynamicStreaming`, на уровне есть `PlayerStart`.
-5. Blueprint-наследник `ATerrainChunk`: материалы рельефа и воды, граф PCG со сэмплером `PCG_ProceduralMeshSampler`. Класс указать в `ChunkClass`. Материал рельефа читает пару ID из R и G и вес G из B. Материал воды читает маску волн из RGB.
-6. Blueprint-наследник `APlayerCharacter` с `DefaultMappingContext`, `IA_Look` и `IA_Walk`.
+2. Назначить `UWorldGenSettings` и по ассету биома на каждый используемый ID, включая тундру, джунгли и предгорья. Пустые `GrassRules` траву этого биома не сажают. `PossiblePOIs` заполняются на ассете биома (пока только данные).
+3. Для осмотра: `SpawnMode = StaticDebugGrid`, Simulate / `TestTerrain`. Коллизии нет, персонаж провалится. В редакторе у менеджера есть CallInEditor `RebuildEditorPreview` / `ClearEditorPreview` (превью-чанки с `bIsEditorPreviewActor` до FinishSpawning, без RegisterComponent до спавна).
+4. Для игры: `SpawnMode = DynamicStreaming` на `L_GameWorld`, на уровне есть `PlayerStart`. Меню — `L_MainMenu`.
+5. Blueprint-наследник `ATerrainChunk`: материалы рельефа и воды (`/Game/MPS/Terrain/Material/M_Terrain`, вода — Datasmith `M_Water` при необходимости), граф PCG `/Game/MPS/Terrain/PCG/PCGG_Base` со сэмплером `PCG_ProceduralMeshSampler`. Класс указать в `ChunkClass`. Материал рельефа читает пару ID из R и G и вес G из B. Материал воды читает маску волн из RGB.
+6. Blueprint-наследник `APlayerCharacter` с `DefaultMappingContext`, `IA_Look` и `IA_Walk`. Игровой PC — `BP_PC_Gameplay`.
+7. Steam-клиент должен быть запущен (AppId 480). Для UI: Blueprint layout с BindWidget-стеками `GameStack` / `GameMenuStack` / `MenuStack` / `ModalStack` и `ToastContainer`; экраны от `UBaseScreenWidget` с `InputConfig` (меню: `Menu` + `NoCapture`).
+
+## 17. Steam-сессии
+
+`USteamSessionSubsystem` (`UGameInstanceSubsystem`):
+
+| API | Поведение |
+|---|---|
+| `CreateSteamSession(MaxPlayers)` | Presence + lobbies (`bUsesPresence` и `bUseLobbiesIfAvailable` оба true — иначе Steam 5.8 отклоняет create). `SETTING_MAPNAME=TestTerrain`. Успех → `OnSessionCreated(true)` и `ServerTravel("/Game/MPS/Levels/L_GameWorld?listen")` |
+| `FindSteamSessions` | `SEARCH_PRESENCE` + `SEARCH_LOBBIES`, не LAN. Результаты → `OnSessionsFound` как `TArray<FBlueprintSessionResult>` |
+| `JoinSteamSession` | `JoinSession` → `GetResolvedConnectString` → `ClientTravel(TRAVEL_Absolute)` |
+
+Делегаты: `OnSessionCreated`, `OnSessionsFound`, `OnSessionJoined`. Повторный create/find/join, пока предыдущий не завершён, игнорируется с предупреждением.
+
+## 18. UI (CommonUI + MVVM)
+
+- **Слои** `EUILayer`: Game, GameMenu, Menu, Modal, Toast. `UBasePrimaryLayout` держит четыре `UCommonActivatableWidgetStack` и `UVerticalBox ToastContainer` (тосты не activatable).
+- **`UUIManagerSubsystem`** на `ULocalPlayer`: `InitializeLayout`, push/remove, глобальный `UGlobalStateViewModel` (`ContextName=GlobalState` через `UMVVMGameSubsystem`), очередь тостов (`MaxVisibleToasts=3`).
+- **Travel.** Layout переживает `ServerTravel` вместе с LocalPlayer. На `OnWorldCleanup` мира layout вызывается `ClearAllStacks` (`SetTransitionDuration(0)` + `ClearWidgets`), затем `RemoveFromParent`. `ApplyGameplayInputMode` ставится после нового `PlayerController` / `BeginPlay` мира (и повторно на next tick): CommonUI `Game` + permanent capture, sync viewport client, `FInputModeGameOnly`, фокус Slate во вьюпорт. Меню-экраны по умолчанию `NoCapture`; клик по фону меню — `Handled`.
+- **View models.** `UMainMenuViewModel` (host/find), `UServerBrowserViewModel` + `UServerRowViewModel` (список сессий для ListView), `UBaseToastWidget` с `FinishToast` / очередью.
+- View model должен жить в мире с `GameInstance`, иначе `GetWorld()` / подсистема сессий недоступны.

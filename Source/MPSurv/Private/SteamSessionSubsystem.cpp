@@ -92,11 +92,17 @@ void USteamSessionSubsystem::FindSteamSessions(int32 MaxSearchResults)
 	}
 
 	SessionSearch = MakeShared<FOnlineSessionSearch>();
-	SessionSearch->MaxSearchResults = MaxSearchResults;
+	// AppId 480 is flooded with foreign lobbies; a low UI limit can drop the whole request before our session appears.
+	constexpr int32 MinUsefulSearchResults = 10000;
+	constexpr int32 ForcedSearchResults = 100000;
+	SessionSearch->MaxSearchResults = (MaxSearchResults < MinUsefulSearchResults) ? ForcedSearchResults : MaxSearchResults;
 	SessionSearch->bIsLanQuery = false;
 	SessionSearch->QuerySettings.Set(SEARCH_PRESENCE, true, EOnlineComparisonOp::Equals);
 	// Steam routes advertised sessions through the lobby search when this key is set.
 	SessionSearch->QuerySettings.Set(SEARCH_LOBBIES, true, EOnlineComparisonOp::Equals);
+
+	UE_LOG(LogTemp, Warning, TEXT("FindSteamSessions: MaxSearchResults=%d (caller asked %d), LAN=false, SEARCH_PRESENCE+SEARCH_LOBBIES."),
+		SessionSearch->MaxSearchResults, MaxSearchResults);
 
 	FindSessionsCompleteHandle = Sessions->AddOnFindSessionsCompleteDelegate_Handle(FindSessionsCompleteDelegate);
 	if (!Sessions->FindSessions(*UserId, SessionSearch.ToSharedRef()) && FindSessionsCompleteHandle.IsValid())
@@ -160,6 +166,8 @@ void USteamSessionSubsystem::OnFindSessionsComplete(bool bWasSuccessful)
 	}
 	FindSessionsCompleteHandle.Reset();
 
+	const int32 RawResultCount = SessionSearch.IsValid() ? SessionSearch->SearchResults.Num() : 0;
+
 	TArray<FBlueprintSessionResult> Results;
 	if (bWasSuccessful && SessionSearch.IsValid())
 	{
@@ -171,6 +179,11 @@ void USteamSessionSubsystem::OnFindSessionsComplete(bool bWasSuccessful)
 			Results.Add(BlueprintResult);
 		}
 	}
+
+	UE_LOG(LogTemp, Warning, TEXT("OnFindSessionsComplete: bWasSuccessful=%s, RawSearchResults=%d, BroadcastCount=%d"),
+		bWasSuccessful ? TEXT("true") : TEXT("false"),
+		RawResultCount,
+		Results.Num());
 
 	OnSessionsFound.Broadcast(Results, bWasSuccessful);
 }

@@ -41,6 +41,47 @@ enum class EBiomeType : uint8
 	Foothills = 10
 };
 
+/** Number of EBiomeType values; indexes PossiblePOIs on FTerrainGenerationSettings. */
+inline constexpr int32 BiomeTypeCount = static_cast<int32>(EBiomeType::Foothills) + 1;
+
+/** Kind of point of interest that can flatten terrain and spawn an actor. */
+UENUM(BlueprintType)
+enum class EPOIType : uint8
+{
+	None,
+	Altar,
+	Ruins,
+	Dungeon
+};
+
+/**
+ * One weighted POI variant for a biome. Soft class resolves on the game thread; the worker reads Type, Weight and radii only.
+ */
+USTRUCT(BlueprintType)
+struct FPOIData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "POI")
+	EPOIType Type = EPOIType::None;
+
+	/** Relative chance among PossiblePOIs of the same biome. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "POI", meta = (ClampMin = "0.0"))
+	float Weight = 1.0f;
+
+	/** Radius of the perfectly flat pad under the foundation. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "POI", meta = (ClampMin = "0.0", Units = "cm"))
+	float FlattenRadius = 2000.0f;
+
+	/** Width of the blend from the flat pad back into procedural height. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "POI", meta = (ClampMin = "0.0", Units = "cm"))
+	float BlendRadius = 1500.0f;
+
+	/** Actor spawned on the flattened site. Unresolved soft path; never LoadSynchronous on a worker. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "POI")
+	TSoftClassPtr<AActor> POIActorClass;
+};
+
 /** Voronoi biomes at a point. */
 struct FBiomeContext
 {
@@ -206,6 +247,12 @@ struct FTerrainGenerationSettings
 	/** Mountain ground below this height is written as foothills. */
 	UPROPERTY(EditDefaultsOnly, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", Units = "cm"))
 	float FoothillsMaxHeight = 8000.0f;
+
+	/**
+	 * Weighted POI variants for each biome. Index is EBiomeType.
+	 * Copied from UBiomeDataAsset::PossiblePOIs on the game thread; FTerrainGenerator reads flatten radii only.
+	 */
+	TArray<FPOIData> PossiblePOIs[BiomeTypeCount];
 
 	// Per-biome shape. Filled on the game thread from the matching UBiomeDataAsset.
 	// Oasis spacing is world layout and comes from UWorldGenSettings.

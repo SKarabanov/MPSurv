@@ -73,6 +73,10 @@
 		{
 			"Name": "GameplayStateTree",
 			"Enabled": true
+		},
+		{
+			"Name": "Iris",
+			"Enabled": true
 		}
 	],
 	"TargetPlatforms": [

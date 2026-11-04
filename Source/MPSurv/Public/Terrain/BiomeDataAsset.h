@@ -8,9 +8,9 @@
 #include "BiomeDataAsset.generated.h"
 
 /**
- * Shape and grass of one biome. Subclasses add only that biome's parameters.
- * The game thread copies the numbers into FTerrainGenerationSettings and the grass meshes stay here; the worker
- * receives neither this asset nor the mesh pointers.
+ * Shape, grass and POI variants of one biome. Subclasses add only that biome's parameters.
+ * The game thread copies the numbers into FTerrainGenerationSettings; grass meshes stay here and soft POI classes
+ * stay unresolved. The worker receives neither this asset nor loaded UObject pointers.
  */
 UCLASS(BlueprintType, Abstract)
 class MPSURV_API UBiomeDataAsset : public UPrimaryDataAsset
@@ -20,7 +20,7 @@ class MPSURV_API UBiomeDataAsset : public UPrimaryDataAsset
 public:
 	virtual FPrimaryAssetId GetPrimaryAssetId() const override;
 
-	/** Writes this biome's fields onto the POD snapshot. The base class has no shape of its own. */
+	/** Writes this biome's fields onto the POD snapshot. The base class copies PossiblePOIs. */
 	virtual void ApplyTo(FTerrainGenerationSettings& Settings) const;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Biome")
@@ -32,6 +32,10 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, Category = "Grass")
 	TArray<FBiomeGrassEntry> GrassRules;
+
+	/** Weighted POI variants that may spawn in this biome. Copied into FTerrainGenerationSettings::PossiblePOIs[BiomeType]. */
+	UPROPERTY(EditAnywhere, Category = "POI")
+	TArray<FPOIData> PossiblePOIs;
 };
 
 UCLASS(BlueprintType)

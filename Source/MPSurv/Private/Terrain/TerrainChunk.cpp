@@ -11,6 +11,7 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "Materials/MaterialInterface.h"
+#include "Net/Core/PushModel/PushModel.h"
 #include "Net/UnrealNetwork.h"
 #include "PCGComponent.h"
 #include "Subsystems/PCGSubsystem.h"
@@ -903,7 +904,9 @@ void ATerrainChunk::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLif
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
-	DOREPLIFETIME(ATerrainChunk, InitData);
+	FDoRepLifetimeParams SharedParams;
+	SharedParams.bIsPushBased = true;
+	DOREPLIFETIME_WITH_PARAMS_FAST(ATerrainChunk, InitData, SharedParams);
 }
 
 void ATerrainChunk::ResetChunkState()
@@ -924,6 +927,7 @@ void ATerrainChunk::ResetChunkState()
 		FlushNetDormancy();
 	}
 	InitData = FChunkInitData();
+	MARK_PROPERTY_DIRTY_FROM_NAME(ATerrainChunk, InitData, this);
 
 	SetActorHiddenInGame(true);
 	SetActorEnableCollision(false);
@@ -1108,6 +1112,7 @@ void ATerrainChunk::InitializeChunk(const FChunkInitData& InData)
 
 	FlushNetDormancy();
 	InitData = InData;
+	MARK_PROPERTY_DIRTY_FROM_NAME(ATerrainChunk, InitData, this);
 	PlaceAtChunkCoords();
 
 	// The sections for this cell are already published. Radius changes only toggle collision and grass.
