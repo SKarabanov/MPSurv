@@ -150,6 +150,8 @@ Saved/
 *.sdf
 *.xcworkspace
 *.DS_Store
+*.slnx
+.vsconfig
 
 # Игнорируем логи и краш-дампы
 *.log
