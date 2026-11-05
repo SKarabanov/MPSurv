@@ -1048,7 +1048,9 @@ void ATerrainChunk::InitializeEditorPreview(const FChunkInitData& InData, bool /
 	// UPCGComponent::OnRegister skips editor preview actors. A normal registration puts the component
 	// into the set FPCGRuntimeGenScheduler walks on every console-variable flush. Destroying it
 	// while that set still holds the pointer calls a pure virtual.
+#if WITH_EDITOR
 	bIsEditorPreviewActor = true;
+#endif
 
 	InitData = InData;
 	InitData.bForceSynchronous = true;
@@ -1081,7 +1083,9 @@ void ATerrainChunk::GenerateEditorPreviewPCG()
 		return;
 	}
 
+#if WITH_EDITOR
 	bIsEditorPreviewActor = true;
+#endif
 	GeneratePCG();
 }
 

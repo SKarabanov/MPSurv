@@ -27,6 +27,9 @@ public:
 	/** Lobby metadata key so AppId 480 searches return only MPSurv sessions. */
 	static const FName MPSURV_SESSION_KEY;
 
+	/** Numerical value stored under MPSURV_SESSION_KEY (Steam numerical lobby filter). */
+	static const int32 MPSURV_SESSION_VALUE;
+
 	/** Fired when Steam finishes creating the session. bWasSuccessful is false when the request is rejected. */
 	UPROPERTY(BlueprintAssignable, Category = "Steam|Session")
 	FSteamSessionCreatedDelegate OnSessionCreated;

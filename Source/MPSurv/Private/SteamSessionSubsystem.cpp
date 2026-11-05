@@ -17,6 +17,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogSteamSession, Log, All);
 #endif
 
 const FName USteamSessionSubsystem::MPSURV_SESSION_KEY = FName(TEXT("MPSurvGameKey"));
+const int32 USteamSessionSubsystem::MPSURV_SESSION_VALUE = 1;
 
 USteamSessionSubsystem::USteamSessionSubsystem()
 	: CreateSessionCompleteDelegate(FOnCreateSessionCompleteDelegate::CreateUObject(this, &ThisClass::OnCreateSessionComplete))
@@ -66,9 +67,18 @@ void USteamSessionSubsystem::CreateSteamSession(int32 MaxPlayers)
 	Settings.bUseLobbiesIfAvailable = true;
 	Settings.bAllowJoinInProgress = true;
 	Settings.bShouldAdvertise = true;
-	Settings.NumPublicConnections = MaxPlayers;
-	Settings.Set(SETTING_MAPNAME, FString(TEXT("TestTerrain")), EOnlineDataAdvertisementType::ViaOnlineService);
-	Settings.Set(MPSURV_SESSION_KEY, FString(TEXT("true")), EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
+	// Required for k_ELobbyTypePublic when invites are enabled; without presence join Steam OSS
+	// still returns Public with invites=false, but discovery/join-via-presence paths stay broken.
+	Settings.bAllowJoinViaPresence = true;
+	Settings.bAllowJoinViaPresenceFriendsOnly = false;
+	Settings.bAllowInvites = true;
+	Settings.NumPublicConnections = FMath::Max(MaxPlayers, 2);
+	Settings.Set(SETTING_MAPNAME, FString(TEXT("L_GameWorld")), EOnlineDataAdvertisementType::ViaOnlineService);
+	// Numerical lobby filter is reliable on AppId 480; string filters often return 0 matches.
+	Settings.Set(MPSURV_SESSION_KEY, MPSURV_SESSION_VALUE, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
+
+	UE_LOG(LogTemp, Warning, TEXT("CreateSteamSession: MaxPlayers=%d, advertise=true, presenceJoin=true, filter=%s=%d"),
+		Settings.NumPublicConnections, *MPSURV_SESSION_KEY.ToString(), MPSURV_SESSION_VALUE);
 
 	CreateSessionCompleteHandle = Sessions->AddOnCreateSessionCompleteDelegate_Handle(CreateSessionCompleteDelegate);
 	if (!Sessions->CreateSession(*UserId, NAME_GameSession, Settings) && CreateSessionCompleteHandle.IsValid())
@@ -95,18 +105,17 @@ void USteamSessionSubsystem::FindSteamSessions(int32 MaxSearchResults)
 	}
 
 	SessionSearch = MakeShared<FOnlineSessionSearch>();
-	// AppId 480 is flooded with foreign lobbies; a low UI limit can drop the whole request before our session appears.
-	constexpr int32 MinUsefulSearchResults = 10000;
-	constexpr int32 ForcedSearchResults = 100000;
-	SessionSearch->MaxSearchResults = (MaxSearchResults < MinUsefulSearchResults) ? ForcedSearchResults : MaxSearchResults;
+	// Steam RequestLobbyList hard-caps around 50; larger values do not help AppId 480 discovery.
+	constexpr int32 SteamLobbyResultCap = 50;
+	SessionSearch->MaxSearchResults = FMath::Clamp(MaxSearchResults > 0 ? MaxSearchResults : SteamLobbyResultCap, 1, SteamLobbyResultCap);
 	SessionSearch->bIsLanQuery = false;
 	SessionSearch->QuerySettings.Set(SEARCH_PRESENCE, true, EOnlineComparisonOp::Equals);
 	// Steam routes advertised sessions through the lobby search when this key is set.
 	SessionSearch->QuerySettings.Set(SEARCH_LOBBIES, true, EOnlineComparisonOp::Equals);
-	SessionSearch->QuerySettings.Set(MPSURV_SESSION_KEY, FString(TEXT("true")), EOnlineComparisonOp::Equals);
+	SessionSearch->QuerySettings.Set(MPSURV_SESSION_KEY, MPSURV_SESSION_VALUE, EOnlineComparisonOp::Equals);
 
-	UE_LOG(LogTemp, Warning, TEXT("FindSteamSessions: MaxSearchResults=%d (caller asked %d), LAN=false, SEARCH_PRESENCE+SEARCH_LOBBIES, filter=%s."),
-		SessionSearch->MaxSearchResults, MaxSearchResults, *MPSURV_SESSION_KEY.ToString());
+	UE_LOG(LogTemp, Warning, TEXT("FindSteamSessions: MaxSearchResults=%d (caller asked %d), LAN=false, filter=%s=%d"),
+		SessionSearch->MaxSearchResults, MaxSearchResults, *MPSURV_SESSION_KEY.ToString(), MPSURV_SESSION_VALUE);
 
 	FindSessionsCompleteHandle = Sessions->AddOnFindSessionsCompleteDelegate_Handle(FindSessionsCompleteDelegate);
 	if (!Sessions->FindSessions(*UserId, SessionSearch.ToSharedRef()) && FindSessionsCompleteHandle.IsValid())
@@ -141,25 +150,39 @@ void USteamSessionSubsystem::JoinSteamSession(const FBlueprintSessionResult& Ses
 	}
 }
 
-void USteamSessionSubsystem::OnCreateSessionComplete(FName /*SessionName*/, bool bWasSuccessful)
+void USteamSessionSubsystem::OnCreateSessionComplete(FName SessionName, bool bWasSuccessful)
 {
-	if (const IOnlineSessionPtr Sessions = GetSessions())
+	const IOnlineSessionPtr Sessions = GetSessions();
+	if (Sessions.IsValid())
 	{
 		Sessions->ClearOnCreateSessionCompleteDelegate_Handle(CreateSessionCompleteHandle);
 	}
 	CreateSessionCompleteHandle.Reset();
 
-	if (bWasSuccessful)
+	if (!bWasSuccessful || !Sessions.IsValid())
 	{
-		OnSessionCreated.Broadcast(true);
-		if (UWorld* World = GetWorld())
-		{
-			World->ServerTravel(TEXT("/Game/MPS/Levels/L_GameWorld?listen"));
-		}
+		OnSessionCreated.Broadcast(false);
 		return;
 	}
 
-	OnSessionCreated.Broadcast(false);
+	// Move Pending -> InProgress so the lobby is treated as an active joinable match.
+	if (!Sessions->StartSession(SessionName))
+	{
+		UE_LOG(LogSteamSession, Warning, TEXT("StartSession(%s) failed after create; continuing with travel."), *SessionName.ToString());
+	}
+
+	if (const FNamedOnlineSession* NamedSession = Sessions->GetNamedSession(SessionName))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CreateSteamSession complete: SessionState=%d Id=%s"),
+			static_cast<int32>(NamedSession->SessionState),
+			NamedSession->SessionInfo.IsValid() ? *NamedSession->SessionInfo->GetSessionId().ToString() : TEXT("invalid"));
+	}
+
+	OnSessionCreated.Broadcast(true);
+	if (UWorld* World = GetWorld())
+	{
+		World->ServerTravel(TEXT("/Game/MPS/Levels/L_GameWorld?listen"));
+	}
 }
 
 void USteamSessionSubsystem::OnFindSessionsComplete(bool bWasSuccessful)

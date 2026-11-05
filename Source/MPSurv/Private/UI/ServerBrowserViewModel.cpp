@@ -42,6 +42,7 @@ void UServerBrowserViewModel::RefreshList()
 	}
 
 	SetIsSearching(true);
+	UE_LOG(LogServerBrowser, Log, TEXT("RefreshList: starting FindSteamSessions(MaxSearchResults=%d)."), ServerBrowserMaxSearchResults);
 	SessionSubsystem->FindSteamSessions(ServerBrowserMaxSearchResults);
 }
 
@@ -94,6 +95,10 @@ void UServerBrowserViewModel::HandleSessionsFound(const TArray<FBlueprintSession
 	ServerList = Rows;
 	// ListView bindings listen to FieldNotify; without this broadcast the widget keeps the previous empty list.
 	UE_MVVM_BROADCAST_FIELD_VALUE_CHANGED(ServerList);
+
+	UE_LOG(LogServerBrowser, Log, TEXT("HandleSessionsFound: bWasSuccessful=%s, Rows=%d"),
+		bWasSuccessful ? TEXT("true") : TEXT("false"),
+		Rows.Num());
 }
 
 USteamSessionSubsystem* UServerBrowserViewModel::GetSessionSubsystem() const
