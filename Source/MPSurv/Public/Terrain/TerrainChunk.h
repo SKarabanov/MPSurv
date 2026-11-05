@@ -559,6 +559,18 @@ struct FBiomeGrassEntry
 	/** Distance where HISM instances are fully culled. Should be >= CullDistanceStart. */
 	UPROPERTY(EditDefaultsOnly, Category = "Grass|Culling", meta = (ClampMin = "0"))
 	int32 CullDistanceEnd = 12000;
+
+	/** Master switch for grass instance shadows (HISM SetCastShadow). */
+	UPROPERTY(EditDefaultsOnly, Category = "Grass|Shadows")
+	bool bCastShadow = false;
+
+	/** Dynamic shadows from movable lights / CSM. Costly with dense HISM grass. */
+	UPROPERTY(EditDefaultsOnly, Category = "Grass|Shadows", meta = (EditCondition = "bCastShadow"))
+	bool bCastDynamicShadow = true;
+
+	/** Static/baked shadows. Usually off for procedural grass. */
+	UPROPERTY(EditDefaultsOnly, Category = "Grass|Shadows", meta = (EditCondition = "bCastShadow"))
+	bool bCastStaticShadow = false;
 };
 
 /** POD placement rules copied into a build request; no UObject pointers, safe on a worker thread. */

@@ -3853,12 +3853,20 @@ UHierarchicalInstancedStaticMeshComponent* ATerrainChunk::EnsureGrassComponent(u
 	const int32 CullStart = FMath::Max(0, Entry->CullDistanceStart);
 	const int32 CullEnd = FMath::Max(CullStart, Entry->CullDistanceEnd);
 
+	auto ApplyGrassHISMSettings = [Entry, CullStart, CullEnd](UHierarchicalInstancedStaticMeshComponent* GrassHISM)
+	{
+		GrassHISM->SetCullDistances(CullStart, CullEnd);
+		GrassHISM->NumCustomDataFloats = 2;
+		GrassHISM->SetCastShadow(Entry->bCastShadow);
+		GrassHISM->bCastDynamicShadow = Entry->bCastDynamicShadow;
+		GrassHISM->bCastStaticShadow = Entry->bCastStaticShadow;
+	};
+
 	if (TObjectPtr<UHierarchicalInstancedStaticMeshComponent>* Existing = BiomeGrassHISMs.Find(BiomeId))
 	{
 		if (UHierarchicalInstancedStaticMeshComponent* GrassHISM = Existing->Get(); IsValid(GrassHISM))
 		{
-			GrassHISM->SetCullDistances(CullStart, CullEnd);
-			GrassHISM->NumCustomDataFloats = 2;
+			ApplyGrassHISMSettings(GrassHISM);
 			return GrassHISM;
 		}
 	}
@@ -3872,12 +3880,10 @@ UHierarchicalInstancedStaticMeshComponent* ATerrainChunk::EnsureGrassComponent(u
 	GrassHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	GrassHISM->SetGenerateOverlapEvents(false);
 	GrassHISM->SetCanEverAffectNavigation(false);
-	GrassHISM->SetCastShadow(false);
 	GrassHISM->bAffectDynamicIndirectLighting = false;
 	GrassHISM->bAffectDistanceFieldLighting = false;
 	GrassHISM->SetReceivesDecals(false);
-	GrassHISM->NumCustomDataFloats = 2;
-	GrassHISM->SetCullDistances(CullStart, CullEnd);
+	ApplyGrassHISMSettings(GrassHISM);
 	BiomeGrassHISMs.Add(BiomeId, GrassHISM);
 	return GrassHISM;
 }
